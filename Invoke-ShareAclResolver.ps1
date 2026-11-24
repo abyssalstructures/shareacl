@@ -51,6 +51,12 @@ $sids = @(Invoke-SqliteQuery -DataSource $Database -Query @"
     $sidFilter
 "@ -SqlParameters $scanParameters | ForEach-Object { $_.sid })
 
+$directoryDomain = $null
+if ($sids.Count -gt 0) {
+    try { $directoryDomain = Get-ADDomain -ErrorAction Stop }
+    catch { } # Continue resolving names, but a negative lookup needs a known domain.
+}
+
 function Get-PrimaryGroupMembers {
     <#
         For domain-local groups whose membership is held in the primaryGroupID
@@ -74,7 +80,7 @@ function Get-PrimaryGroupMembers {
 }
 
 function Resolve-Sid {
-    param([string]$Sid)
+    param([string]$Sid, $DirectoryDomain)
     $now = [DateTime]::UtcNow.ToString('o')
 
     # Well-known check
@@ -88,9 +94,15 @@ function Resolve-Sid {
     } catch { }
 
     $deleted = $false
+    $domainSearchCompleted = $false
     $lookupError = $null
+    $directoryScope = @{}
+    if ($DirectoryDomain.DNSRoot -and $DirectoryDomain.DistinguishedName -and $DirectoryDomain.DomainSID) {
+        $directoryScope.Server = $DirectoryDomain.DNSRoot
+        $directoryScope.SearchBase = $DirectoryDomain.DistinguishedName
+    }
     try {
-        $objects = @(Get-ADObject -Filter { ObjectSID -eq $Sid } -IncludeDeletedObjects `
+        $objects = @(Get-ADObject @directoryScope -Filter { ObjectSID -eq $Sid } -IncludeDeletedObjects `
             -Properties sAMAccountName, objectClass, isDeleted -ErrorAction Stop)
         $obj = $objects | Where-Object { -not $_.isDeleted } | Select-Object -First 1
         if ($obj) {
@@ -104,15 +116,21 @@ function Resolve-Sid {
             return @{ name=$obj.Name; domain=$env:USERDOMAIN; sam=$obj.sAMAccountName; type=$type; wk=0; now=$now }
         }
         $deleted = $objects.Count -gt 0
+        $domainSearchCompleted = $directoryScope.Count -gt 0 -and $sidObj.AccountDomainSid.Value -eq $DirectoryDomain.DomainSID.Value
     } catch { $lookupError = $_.Exception.Message }
 
     # Last attempt: LSA translate
+    $nameNotMapped = $false
     try {
-        $nt = ([System.Security.Principal.SecurityIdentifier]::new($Sid)).Translate([System.Security.Principal.NTAccount]).Value
+        $nt = $sidObj.Translate([System.Security.Principal.NTAccount]).Value
         return @{ name=$nt; type='Unknown'; wk=0; now=$now }
-    } catch { }
+    } catch {
+        $nameNotMapped = $_.Exception.GetBaseException() -is [System.Security.Principal.IdentityNotMappedException]
+    }
 
-    if ($deleted) { return @{ type='Orphaned'; wk=0; now=$now; orphan=1 } }
+    if ($deleted -or ($domainSearchCompleted -and $nameNotMapped)) {
+        return @{ type='Orphaned'; wk=0; now=$now; orphan=1 }
+    }
     @{ type='Unknown'; wk=0; now=$now; lookupError=$lookupError }
 }
 
@@ -127,7 +145,7 @@ foreach ($sid in $sids) {
     Write-ResolverProgress -Phase 'Principals' -Current $principalIndex -Total $sids.Count `
         -Activity ("Resolving principal {0:N0} of {1:N0}: {2}" -f $principalIndex, $sids.Count, $sid)
 
-    $r = Resolve-Sid -Sid $sid
+    $r = Resolve-Sid -Sid $sid -DirectoryDomain $directoryDomain
     if ($r.lookupError) {
         $lookupFailures++
         if ($lookupFailures -eq 1) { Write-Warning "Directory lookup failed for ${sid}: $($r.lookupError)" }

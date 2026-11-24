@@ -1,9 +1,9 @@
 == ShareAcl v1.0-RC3 - 2026-11-24 ==
 
 Improvements:
-- ACL Swap limits discovery to the selected scope, skips reparse paths, previews live explicit rules, and commits each replacement as one DACL write. Verify checks the exact replacement rules from the executed run.
+- ACL Swap limits discovery to the selected scope, skips reparse paths, previews live explicit rules, and commits each replacement as one DACL write that preserves audit rules. Verify checks the exact replacement rules from the executed run.
 - Live walk can include explicit file ACLs and reports progress during discovery. Scan previews are invalidated when their scan or database changes.
-- Resolver reruns replace group memberships after successful expansion, preserve earlier results on lookup errors, and distinguish unresolved trustees from confirmed deleted objects.
+- Resolver reruns replace group memberships after successful expansion, preserve earlier results on lookup errors, and distinguish unresolved trustees from confirmed orphaned SIDs.
 - Collector counting and collection use the same junction and depth rules. Resuming by scan ID preserves the original depth and committed counts.
 - Database creation stages and checks a replacement before overwriting. Account view labels historical matches as ACEs and keeps live effective access separate.
 

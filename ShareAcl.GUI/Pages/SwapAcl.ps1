@@ -60,6 +60,17 @@ function Get-ShareAclDescriptor {
     [System.Security.AccessControl.RawSecurityDescriptor]::new($Acl.GetSecurityDescriptorBinaryForm(), 0)
 }
 
+function Set-ShareAclDacl {
+    param([string]$Path, [System.Security.AccessControl.FileSystemSecurity]$Security)
+
+    # These overloads persist only modified sections. Set-Acl can write every section.
+    if ($Security -is [System.Security.AccessControl.DirectorySecurity]) {
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($Path), $Security)
+    } else {
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($Path), $Security)
+    }
+}
+
 function Invoke-ShareAclReplacement {
     param([string]$Path, [string]$SourceSid, [string]$TargetSid, [string]$ApprovedRules)
 
@@ -79,11 +90,15 @@ function Invoke-ShareAclReplacement {
 
     $bytes = [byte[]]::new($descriptor.BinaryLength)
     $descriptor.GetBinaryForm($bytes, 0)
-    $acl.SetSecurityDescriptorBinaryForm($bytes, [System.Security.AccessControl.AccessControlSections]::Access)
-    $staged = Get-ShareAclDescriptor $acl
+    $writeSecurity = if ($acl -is [System.Security.AccessControl.DirectorySecurity]) {
+        [System.Security.AccessControl.DirectorySecurity]::new()
+    } else {
+        [System.Security.AccessControl.FileSecurity]::new()
+    }
+    $writeSecurity.SetSecurityDescriptorBinaryForm($bytes, [System.Security.AccessControl.AccessControlSections]::Access)
+    $staged = Get-ShareAclDescriptor $writeSecurity
     $expected = Get-ShareAclRuleSignature @(Get-ShareAclExplicitRules $staged.DiscretionaryAcl $TargetSid)
 
-    # Commit the whole DACL once. Owner, group and SACL are outside this write.
-    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+    Set-ShareAclDacl $Path $writeSecurity
     @{ Code = 'ok'; Detail = "Replaced $($source.Count) explicit rule(s)."; Expected = $expected }
 }

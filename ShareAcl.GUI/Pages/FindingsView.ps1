@@ -38,7 +38,7 @@ $catalogue = @(
         Name        = 'Orphaned SIDs on ACEs'
         Severity    = 'High'
         SwapCapable = $true
-        Description = 'ACEs referencing SIDs that the resolver found on deleted Active Directory objects.'
+        Description = 'ACEs referencing deleted Active Directory objects or unmapped SIDs absent from their own domain.'
         Query       = @"
 SELECT f.path AS Path,
        a.trustee_sid AS Sid,

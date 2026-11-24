@@ -130,7 +130,7 @@ The resolver is important here: without resolved group membership, Account view 
 
 Use **Findings** as a first-pass permission review. It groups and prioritises patterns including:
 
-- Orphaned SIDs confirmed by a deleted Active Directory object
+- Orphaned SIDs confirmed by a deleted Active Directory object or an unmapped SID absent from its own domain
 - Trustees awaiting a conclusive identity lookup
 - Everyone exposure
 - Non-admin Full Control

@@ -82,21 +82,48 @@ try {
     $before = (Get-Acl -LiteralPath $file).Sddl
     & {
         $attempts = [System.Collections.Generic.List[string]]::new()
-        function Set-Acl {
-            [CmdletBinding()]
-            param([string]$LiteralPath, $AclObject)
-            $attempts.Add($LiteralPath)
+        function Set-ShareAclDacl {
+            param([string]$Path, $Security)
+            $attempts.Add($Path)
+            $flags = [Reflection.BindingFlags]'Instance, NonPublic'
+            $type = $Security.GetType()
+            $null = $type.GetMethod('ReadLock', $flags).Invoke($Security, $null)
+            try {
+                foreach ($section in 'AccessRulesModified', 'AuditRulesModified', 'OwnerModified', 'GroupModified') {
+                    $modified = $type.GetProperty($section, $flags).GetValue($Security)
+                    Assert-Test ($modified -eq ($section -eq 'AccessRulesModified')) "Unexpected write flag for $section."
+                }
+            } finally {
+                $null = $type.GetMethod('ReadUnlock', $flags).Invoke($Security, $null)
+            }
             throw 'Simulated ACL write failure'
         }
         $failure = $null
         try { Invoke-ShareAclReplacement $file $source $target $approved | Out-Null }
         catch { $failure = $_ }
-        Assert-Test ($attempts.Count -eq 1 -and $failure.Exception.Message -like '*Simulated ACL write failure*') 'Replacement failed without one complete DACL write attempt.'
+        Assert-Test ($attempts.Count -eq 1 -and $failure.Exception.Message -like '*Simulated ACL write failure*') `
+            "Expected one complete DACL write attempt, got $($attempts.Count). $($failure.Exception.Message)"
     }
     Assert-Test ((Get-Acl -LiteralPath $file).Sddl -ceq $before) 'Failed replacement left a partial ACL.'
+    $auditSection = [System.Security.AccessControl.AccessControlSections]::Audit
+    $auditBefore = $null
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    if ([System.Security.Principal.WindowsPrincipal]::new($identity).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $audit = [System.Security.AccessControl.FileSecurity]::new()
+        $audit.SetAuditRuleProtection($true, $false)
+        $audit.AddAuditRule([System.Security.AccessControl.FileSystemAuditRule]::new(
+            $identity.User, [System.Security.AccessControl.FileSystemRights]::ReadData, [System.Security.AccessControl.AuditFlags]::Success))
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($file), $audit)
+        $auditBefore = (Get-Acl -LiteralPath $file -Audit).GetSecurityDescriptorSddlForm($auditSection)
+        Assert-Test ($auditBefore -like 'S:P*(*') 'The elevated fixture could not seed a protected audit rule.'
+    }
     $replaced = Invoke-ShareAclReplacement $file $source $target $approved
     Assert-Test ($replaced.Code -eq 'ok' -and -not (Get-TestSignature $file $source)) 'Source rules were not replaced.'
     Assert-Test ((Get-TestSignature $file $target) -ceq $replaced.Expected) 'Written target ACL differs from its staged rules.'
+    if ($auditBefore) {
+        Assert-Test ((Get-Acl -LiteralPath $file -Audit).GetSecurityDescriptorSddlForm($auditSection) -ceq $auditBefore) 'Swap changed the protected audit rule.'
+        Write-Host 'PASS: Elevated NTFS swap preserves the protected SACL'
+    }
     Write-Host 'PASS: Real NTFS file replacement preserves expected target rules and rejects drift'
 
     $database = Join-Path $base 'audit.db'
@@ -180,19 +207,21 @@ INSERT INTO principals(sid,principal_type,last_resolved_utc) VALUES ('legacy','O
     $nested = 'S-1-5-21-100-200-300-1112'
     $member = 'S-1-5-21-100-200-300-1113'
     $removed = 'S-1-5-21-100-200-300-1114'
-    $unclassified = 'S-1-5-21-100-200-300-1120'
+    $unclassified = 'S-1-5-21-100-200-400-1120'
     $deleted = 'S-1-5-21-100-200-300-1121'
+    $missing = 'S-1-5-21-100-200-300-1122'
+    $outage = 'S-1-5-21-100-200-300-1123'
     Invoke-SqliteQuery -DataSource $resDb -Query @'
 INSERT INTO scans(scan_id,started_utc,root_paths_json,status) VALUES (1,'now','[]','completed');
 INSERT INTO folders(folder_id,scan_id,path,depth,inheritance_enabled,visited_utc) VALUES (1,1,'fixture',0,1,'now');
 INSERT INTO principals(sid, name, principal_type, last_resolved_utc)
 VALUES (@group,'Group','Group','cached'), (@member,'Member','User','cached'), (@removed,'Removed','User','cached'),
-       (@unknown,NULL,'Orphaned','legacy');
+       (@missing,NULL,'Orphaned','legacy');
 INSERT INTO aces(folder_id,trustee_sid,access_control_type,rights_text,rights_mask,inheritance_flags,propagation_flags,is_inherited)
 VALUES (1,@group,'Allow','ReadData',1,'None','None',0), (1,@unknown,'Allow','ReadData',1,'None','None',0),
-       (1,@deleted,'Allow','ReadData',1,'None','None',0);
+       (1,@deleted,'Allow','ReadData',1,'None','None',0), (1,@missing,'Allow','ReadData',1,'None','None',0);
 INSERT INTO group_members(group_sid,member_sid,depth) VALUES (@group,@removed,1), (@group,@member,3);
-'@ -SqlParameters @{ group = $group; member = $member; removed = $removed; unknown = $unclassified; deleted = $deleted } | Out-Null
+'@ -SqlParameters @{ group = $group; member = $member; removed = $removed; unknown = $unclassified; deleted = $deleted; missing = $missing } | Out-Null
 
     $directory = @{
         Deleted = @($deleted); FailedGroups = @()
@@ -211,22 +240,30 @@ INSERT INTO group_members(group_sid,member_sid,depth) VALUES (@group,@removed,1)
     $groupRow = $principalRows | Where-Object sid -eq $group
     $unclassifiedRow = $principalRows | Where-Object sid -eq $unclassified
     $deletedRow = $principalRows | Where-Object sid -eq $deleted
+    $missingRow = $principalRows | Where-Object sid -eq $missing
     Assert-Test ($groupRow.last_resolved_utc -eq 'cached') 'Whole-database resolver reprocessed a cached principal.'
-    Assert-Test ($unclassifiedRow.principal_type -eq 'Unknown' -and $unclassifiedRow.orphan_confirmed -eq 0) 'Inconclusive lookup was saved as deleted.'
+    Assert-Test ($unclassifiedRow.principal_type -eq 'Unknown' -and $unclassifiedRow.orphan_confirmed -eq 0) 'A missing foreign-domain SID was confirmed as orphaned.'
     Assert-Test ($deletedRow.principal_type -eq 'Orphaned' -and $deletedRow.orphan_confirmed -eq 1) 'Deleted-object evidence was lost.'
+    Assert-Test ($missingRow.principal_type -eq 'Orphaned' -and $missingRow.orphan_confirmed -eq 1) 'An unmapped SID absent from its own domain was missed.'
     $findings = Get-Content -LiteralPath (Join-Path $repo 'ShareAcl.GUI/Pages/FindingsView.ps1') -Raw
     $orphanSql = [regex]::Match($findings, '(?s)Id\s*=\s*''orphaned''.*?@"\r?\n(.*?)\r?\n"@').Groups[1].Value
     $pendingSql = [regex]::Match($findings, '(?s)Id\s*=\s*''unclassified''.*?@"\r?\n(.*?)\r?\n"@').Groups[1].Value
     $orphans = @(Invoke-SqliteQuery -DataSource $resDb -Query $orphanSql -SqlParameters @{ scan = 1 })
     $pending = @(Invoke-SqliteQuery -DataSource $resDb -Query $pendingSql -SqlParameters @{ scan = 1 })
-    Assert-Test ($orphans.Count -eq 1 -and $orphans[0].Sid -eq $deleted -and
+    Assert-Test ($orphans.Count -eq 2 -and $deleted -in $orphans.Sid -and $missing -in $orphans.Sid -and
         $pending.Count -eq 1 -and $pending[0].Sid -eq $unclassified) 'Findings confused confirmed and unresolved SIDs.'
 
     $directory.FailedGroups = @($nested)
     $directory.LookupError = $true
     $directory | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $env:SHAREACL_TEST_DIRECTORY
+    Invoke-SqliteQuery -DataSource $resDb -Query @'
+INSERT INTO aces(folder_id,trustee_sid,access_control_type,rights_text,rights_mask,inheritance_flags,propagation_flags,is_inherited)
+VALUES (1,@sid,'Allow','ReadData',1,'None','None',0)
+'@ -SqlParameters @{ sid = $outage } | Out-Null
     $code = Invoke-TestScript $resolver @('-Database', $resDb, '-ScanId', '1')
     Assert-Test ($code -eq 1) "A partial resolver refresh returned exit code $code."
+    $outageRow = Invoke-SqliteQuery -DataSource $resDb -Query 'SELECT principal_type,orphan_confirmed FROM principals WHERE sid=@sid' -SqlParameters @{ sid = $outage }
+    Assert-Test ($outageRow.principal_type -eq 'Unknown' -and $outageRow.orphan_confirmed -eq 0) 'A failed own-domain lookup was confirmed as orphaned.'
     $remaining = @(Invoke-SqliteQuery -DataSource $resDb -Query 'SELECT member_sid,depth FROM group_members WHERE group_sid=@g ORDER BY member_sid' `
         -SqlParameters @{ g = $group })
     Assert-Test (($remaining | ConvertTo-Json -Compress) -eq ($members | ConvertTo-Json -Compress)) 'Failed nested lookup replaced the last complete membership.'
@@ -322,6 +359,35 @@ SELECT folder_id,@source,'Allow','ReadData',1,'None','None',0 FROM folders WHERE
     $fileResult = $page.FindName('GrdVerify').ItemsSource | Where-Object Path -eq $liveFile
     Assert-Test ($fileResult.Status -eq 'TARGET_MISMATCH') 'A missing target rule was counted as verified.'
     Write-Host 'PASS: WPF scan context, live file preview and execution, progress and verification'
+
+    Invoke-SqliteQuery -DataSource $database -Query @'
+INSERT INTO scans(scan_id,started_utc,root_paths_json,status) VALUES (20,'now','[]','completed');
+INSERT INTO folders(scan_id,path,depth,inheritance_enabled,visited_utc)
+VALUES (20,'Deny-only',0,1,'now'), (20,'Mixed',0,1,'now');
+INSERT INTO aces(folder_id,trustee_sid,access_control_type,rights_text,rights_mask,inheritance_flags,propagation_flags,is_inherited)
+SELECT folder_id,@sid,'Deny','ReadData',1,'None','None',0 FROM folders WHERE scan_id=20
+UNION ALL SELECT folder_id,@sid,'Allow','ReadData',1,'None','None',0 FROM folders WHERE scan_id=20 AND path='Mixed';
+'@ -SqlParameters @{ sid = $source } | Out-Null
+    $accountDir = Join-Path $repo 'ShareAcl.GUI/Pages'
+    $reader = [System.Xml.XmlReader]::Create((Join-Path $accountDir 'AccountView.xaml'))
+    try { $accountPage = [System.Windows.Markup.XamlReader]::Load($reader) }
+    finally { $reader.Dispose() }
+    $accountPage.Tag = [pscustomobject]@{ State = $null }
+    $ui.CurrentScanId = 20
+    & (Join-Path $accountDir 'AccountView.ps1') -Page $accountPage -App $ui
+    $accountView = $accountPage.Tag.State
+    $accountView.PrincipalSid = $source
+    $accountView.PrincipalName = 'Source'
+    & $accountView.LoadReachable $accountView
+    $accountRows = @($accountView.Controls.GrdReachable.ItemsSource)
+    Assert-Test ($ui.Status -like '*3 matching ACEs*' -and $accountRows.Count -eq 3 -and
+        ($accountRows | Where-Object Path -eq 'Deny-only').AceType -eq 'Deny') 'Account view treated historical Deny matches as access or omitted them.'
+    $accountView.Controls.ChkAllowOnly.IsChecked = $true
+    & $accountView.LoadReachable $accountView
+    $accountRows = @($accountView.Controls.GrdReachable.ItemsSource)
+    Assert-Test ($ui.Status -like '*1 matching ACEs*' -and $accountRows.Count -eq 1 -and
+        $accountRows[0].AceType -eq 'Allow' -and $accountRows[0].Path -eq 'Mixed') 'The Allow ACEs filter did not filter the Deny-only and mixed folders.'
+    Write-Host 'PASS: Account view labels Deny-only and mixed folders as historical ACE matches'
 
     $guiAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'ShareAcl.GUI/Start-ShareAclGui.ps1'), [ref]$null, [ref]$null)
     $queueAssignment = $guiAst.Find({
