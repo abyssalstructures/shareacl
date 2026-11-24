@@ -19,63 +19,74 @@
     Limit recursion depth. Default: unlimited.
 
 .PARAMETER Resume
-    Continue the most recent 'running' scan in the DB instead of starting a new one.
+    Continue an interrupted scan. Use ScanId when more than one scan is unfinished.
+
+.PARAMETER ScanId
+    Select a specific unfinished scan to resume.
 
 .EXAMPLE
     .\Invoke-ShareAclCollector.ps1 -RootPath '\\fs01\Finance','\\fs01\HR' -Database .\shareacl.db
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'New')]
 param(
-    [Parameter(Mandatory)] [string[]] $RootPath,
+    [Parameter(Mandatory, ParameterSetName = 'New')]
+    [Parameter(ParameterSetName = 'Resume')]
+    [string[]] $RootPath,
     [Parameter(Mandatory)] [string]   $Database,
-    [int]    $BatchSize = 500,
-    [int]    $MaxDepth  = [int]::MaxValue,
-    [switch] $Resume
+    [ValidateRange(1, [int]::MaxValue)] [int] $BatchSize = 500,
+    [ValidateRange(0, [int]::MaxValue)] [int] $MaxDepth = [int]::MaxValue,
+    [Parameter(Mandatory, ParameterSetName = 'Resume')] [switch] $Resume,
+    [Parameter(ParameterSetName = 'Resume')] [ValidateRange(1, [int]::MaxValue)] [int] $ScanId
 )
 
 $ErrorActionPreference = 'Stop'
-# Right after $ErrorActionPreference = 'Stop'
-trap {
-    try { [System.Data.SQLite.SQLiteConnection]::ClearAllPools() } catch {}
-    [GC]::Collect(); [GC]::WaitForPendingFinalizers(); [GC]::Collect()
-    # let the error continue propagating
-    continue
-}
-$script:SchemaPath = Join-Path $PSScriptRoot 'schema.sql'
+. (Join-Path $PSScriptRoot 'ShareAcl.Database.ps1')
 
 # -----------------------------------------------------------------------------
 # DB helpers
 # -----------------------------------------------------------------------------
-function Initialize-Database {
-    param([string]$Path)
-    if (-not (Test-Path $Path)) {
-        New-Item -ItemType File -Path $Path | Out-Null
-    }
-    $schema = Get-Content -Raw -Path $script:SchemaPath
-    Invoke-SqliteQuery -DataSource $Path -Query $schema | Out-Null
-}
-
 function New-ScanRecord {
-    param([string]$Path, [string[]]$Roots)
-    $rootsJson = ($Roots | ConvertTo-Json -Compress)
-    $now = [DateTime]::UtcNow.ToString('o')
-    Invoke-SqliteQuery -DataSource $Path -Query @"
-        INSERT INTO scans (started_utc, root_paths_json, host, operator, status)
-        VALUES (@started, @roots, @host, @op, 'running');
-        SELECT last_insert_rowid() AS scan_id;
-"@ -SqlParameters @{
-        started = $now
-        roots   = $rootsJson
-        host    = $env:COMPUTERNAME
-        op      = "$env:USERDOMAIN\$env:USERNAME"
-    } | Select-Object -ExpandProperty scan_id
+    param([string]$Path, [string[]]$Roots, [int]$Depth)
+
+    $connection = New-SQLiteConnection -DataSource $Path
+    try {
+        $transaction = $connection.BeginTransaction()
+        try {
+            $id = (Invoke-SqliteQuery -SQLiteConnection $connection -Query @'
+INSERT INTO scans(started_utc, root_paths_json, host, operator, status, max_depth)
+VALUES (@started, @roots, @host, @op, 'counting', @depth);
+SELECT last_insert_rowid() AS scan_id;
+'@ -SqlParameters @{
+                started = [DateTime]::UtcNow.ToString('o'); roots = ConvertTo-Json -InputObject $Roots -Compress
+                host = $env:COMPUTERNAME; op = "$env:USERDOMAIN\$env:USERNAME"; depth = $Depth
+            }).scan_id
+            foreach ($root in $Roots) {
+                Invoke-SqliteQuery -SQLiteConnection $connection -Query @'
+INSERT INTO folders_pending(scan_id, path, parent_id, depth) VALUES (@id, @path, NULL, 0)
+'@ -SqlParameters @{ id = $id; path = $root } | Out-Null
+            }
+            $transaction.Commit()
+            $id
+        } finally { $transaction.Dispose() }
+    } finally { $connection.Dispose() }
 }
 
-function Get-ResumableScanId {
-    param([string]$Path)
-    (Invoke-SqliteQuery -DataSource $Path -Query @"
-        SELECT scan_id FROM scans WHERE status = 'running' ORDER BY scan_id DESC LIMIT 1
-"@).scan_id
+function Get-ResumableScan {
+    param([string]$Path, [int]$Id, [string[]]$Roots)
+
+    $candidate = @(Invoke-SqliteQuery -DataSource $Path -Query @'
+SELECT scan_id, status, total_folders, root_paths_json, max_depth FROM scans
+WHERE (status IN ('counting', 'running') OR (status IN ('failed', 'aborted') AND EXISTS (
+    SELECT 1 FROM folders_pending p WHERE p.scan_id = scans.scan_id))) AND (@id = 0 OR scan_id = @id)
+ORDER BY scan_id DESC
+'@ -SqlParameters @{ id = $Id } | Where-Object {
+        if (-not $Roots) { return $true }
+        $stored = @($_.root_paths_json | ConvertFrom-Json | ForEach-Object { ConvertTo-ScanRoot $_ } | Sort-Object -Unique)
+        ($stored -join "`n") -eq ($Roots -join "`n")
+    })
+    if ($candidate.Count -eq 0) { throw 'No unfinished scan matches the requested scan ID and roots.' }
+    if ($candidate.Count -gt 1) { throw 'Multiple unfinished scans match. Specify -ScanId to choose one.' }
+    $candidate[0]
 }
 
 function Complete-ScanRecord {
@@ -83,9 +94,20 @@ function Complete-ScanRecord {
     $now = [DateTime]::UtcNow.ToString('o')
     Invoke-SqliteQuery -DataSource $Path -Query @"
         UPDATE scans SET completed_utc=@done, status=@status,
-                         folder_count=@fc, ace_count=@ac, error_count=@ec
+                         folder_count=@fc, processed_folders=@fc, ace_count=@ac, error_count=@ec,
+                         last_updated_utc=@done
         WHERE scan_id=@id
 "@ -SqlParameters @{ done=$now; status=$Status; fc=$Folders; ac=$Aces; ec=$Errors; id=$ScanId } | Out-Null
+}
+
+function Get-CommittedScanCounts {
+    param([string]$Path, [int]$ScanId)
+
+    Invoke-SqliteQuery -DataSource $Path -Query @'
+SELECT (SELECT COUNT(*) FROM folders WHERE scan_id = @id) AS folders,
+       (SELECT COUNT(*) FROM aces a JOIN folders f ON f.folder_id = a.folder_id WHERE f.scan_id = @id) AS aces,
+       (SELECT COUNT(*) FROM scan_errors WHERE scan_id = @id) AS errors
+'@ -SqlParameters @{ id = $ScanId }
 }
 
 function Set-ScanStatus {
@@ -230,9 +252,10 @@ function Get-FolderCount {
             Write-Host ("  counting… {0:N0} folders discovered so far" -f $total)
         }
 
-        if ($MaxDepth -gt 0 -and $cur.Depth -ge $MaxDepth) { continue }
+        if ($cur.Depth -ge $MaxDepth) { continue }
 
         try {
+            if ([IO.File]::GetAttributes($cur.Path) -band [IO.FileAttributes]::ReparsePoint) { continue }
             foreach ($sub in [System.IO.Directory]::EnumerateDirectories($cur.Path)) {
                 $queue.Enqueue(@{ Path = $sub; Depth = $cur.Depth + 1 })
             }
@@ -241,6 +264,12 @@ function Get-FolderCount {
         }
     }
     $total
+}
+
+function ConvertTo-ScanRoot {
+    param([string]$Path)
+
+    [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Path, $PWD.ProviderPath))
 }
 
 function Get-AceTrusteeSid {
@@ -280,31 +309,33 @@ function Get-AceTrusteeSid {
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-Initialize-Database -Path $Database
+$Database = [IO.Path]::GetFullPath($Database, $PWD.ProviderPath)
+if ($Resume -and -not [IO.File]::Exists($Database)) { throw "Database not found: $Database" }
+Initialize-ShareAclDatabaseFile -Database $Database
+$RootPath = @($RootPath | Where-Object { $_ } | ForEach-Object { ConvertTo-ScanRoot $_ } | Sort-Object -Unique)
 
 if ($Resume) {
-    $scanId = Get-ResumableScanId -Path $Database
-    if (-not $scanId) { throw "No resumable scan found in $Database." }
+    $previous = Get-ResumableScan -Path $Database -Id $ScanId -Roots $RootPath
+    $scanId = $previous.scan_id
+    $RootPath = @($previous.root_paths_json | ConvertFrom-Json)
+    if ($null -ne $previous.max_depth) {
+        if ($PSBoundParameters.ContainsKey('MaxDepth') -and $MaxDepth -ne $previous.max_depth) {
+            throw "Scan $scanId was started with MaxDepth $($previous.max_depth). Resume with that depth."
+        }
+        $MaxDepth = [int]$previous.max_depth
+    }
+    $needsCount = $previous.status -eq 'counting'
+    $totalCount = $previous.total_folders
     Write-Host "Resuming scan_id=$scanId" -ForegroundColor Cyan
 } else {
-    $scanId = New-ScanRecord -Path $Database -Roots $RootPath
+    if ($RootPath.Count -eq 0) { throw 'Provide at least one scan root.' }
+    $scanId = New-ScanRecord -Path $Database -Roots $RootPath -Depth $MaxDepth
+    $needsCount = $true
+    $totalCount = $null
     Write-Host "Started scan_id=$scanId" -ForegroundColor Cyan
-
-    # Seed the pending queue with the roots
-    foreach ($r in $RootPath) {
-        Invoke-SqliteQuery -DataSource $Database -Query @"
-            INSERT OR IGNORE INTO folders_pending(scan_id,path,parent_id,depth)
-            VALUES (@s,@p,NULL,0)
-"@ -SqlParameters @{ s=$scanId; p=$r } | Out-Null
-    }
 }
 
-$totalCount   = $null
-$runStartTime = $null
-
-if (-not $Resume) {
-    # Transition to counting phase
-    Set-ScanStatus -Path $Database -ScanId $scanId -Status 'counting'
+if ($needsCount) {
     Write-Host "Counting folders under: $($RootPath -join ', ')" -ForegroundColor Cyan
 
     $countStart = [System.DateTime]::UtcNow
@@ -318,23 +349,8 @@ if (-not $Resume) {
         $totalCount = $null
     }
 
-    Set-ScanStatus -Path $Database -ScanId $scanId -Status 'running'
-
-    # Seed the pending queue with the roots (moved here from the existing spot, unchanged)
-    foreach ($r in $RootPath) {
-        Invoke-SqliteQuery -DataSource $Database -Query @"
-            INSERT OR IGNORE INTO folders_pending(scan_id,path,parent_id,depth)
-            VALUES (@s,@p,NULL,0)
-"@ -SqlParameters @{ s=$scanId; p=$r } | Out-Null
-    }
-} else {
-    # For resumed scans, pull the previously-recorded total (may be NULL)
-    $prevRow = Invoke-SqliteQuery -DataSource $Database -Query @"
-        SELECT total_folders FROM scans WHERE scan_id = @id
-"@ -SqlParameters @{ id = $scanId }
-    if ($prevRow -and $prevRow.total_folders) { $totalCount = [int64]$prevRow.total_folders }
-    Set-ScanStatus -Path $Database -ScanId $scanId -Status 'running'
 }
+Set-ScanStatus -Path $Database -ScanId $scanId -Status 'running'
 
 # Record the moment the actual scan begins — used for rate calc, excludes the counting phase
 $runStartTime = [System.DateTime]::UtcNow
@@ -380,25 +396,27 @@ INSERT OR IGNORE INTO folders_pending(scan_id,path,parent_id,depth) VALUES (@s,@
     [void]$insPending.Parameters.Add($_, [System.Data.DbType]::Object)
 }
 
-# Counters
-$totalFolders = 0; $totalAces = 0; $totalErrors = 0
+# Counters include rows committed before an interrupted run was resumed.
+$committed = Get-CommittedScanCounts -Path $Database -ScanId $scanId
+$startFolders = $totalFolders = $committed.folders
+$totalAces = $committed.aces
+$totalErrors = $committed.errors
 $status = 'running'
 
 try {
     while ($true) {
-        # Pull the next batch from the pending queue
-        $batch = Invoke-SqliteQuery -SQLiteConnection $conn -Query @"
+        $tx = $conn.BeginTransaction()
+        try {
+            # Take the writer lock before reading the queue so two processes cannot claim the same paths.
+            $batch = Invoke-SqliteQuery -SQLiteConnection $conn -Query @"
             SELECT path, parent_id, depth FROM folders_pending
             WHERE scan_id=@s ORDER BY depth ASC, path ASC LIMIT @n
 "@ -SqlParameters @{ s=$scanId; n=$BatchSize }
+            if (-not $batch) { break }
 
-        if (-not $batch) { break }
-
-        $tx = $conn.BeginTransaction()
-        try {
             foreach ($row in $batch) {
                 $path   = [string]$row.path
-                $parent = if ($row.parent_id -is [DBNull]) { $null } else { [int64]$row.parent_id }
+                $parent = if ($null -ne $row.parent_id -and $row.parent_id -isnot [DBNull]) { [int64]$row.parent_id } else { $null }
                 $depth  = [int]$row.depth
 
                 $facts = Get-FolderFacts -Path $path
@@ -455,7 +473,7 @@ try {
                 }
 
                 # Enqueue children unless we're at MaxDepth or hit a reparse point
-                if (-not $facts.IsReparse -and $depth -lt $MaxDepth) {
+                if ($facts.ContainsKey('IsReparse') -and -not $facts.IsReparse -and $depth -lt $MaxDepth) {
                     try {
                         $children = Get-ChildItem -LiteralPath $path -Directory -Force -ErrorAction Stop
                         foreach ($c in $children) {
@@ -489,7 +507,7 @@ try {
         Write-Host ("  processed {0,8} folders | {1,9} ACEs | {2,4} errors" -f $totalFolders, $totalAces, $totalErrors)
         if ($totalCount -and $totalCount -gt 0) {
             $elapsed = ([System.DateTime]::UtcNow - $runStartTime).TotalSeconds
-            $rate    = if ($elapsed -gt 0) { $totalFolders / $elapsed } else { 0 }
+            $rate    = if ($elapsed -gt 0) { ($totalFolders - $startFolders) / $elapsed } else { 0 }
             $remaining = [Math]::Max(0, $totalCount - $totalFolders)
             $etaSecs = if ($rate -gt 0) { $remaining / $rate } else { 0 }
             $etaUtc  = [System.DateTime]::UtcNow.AddSeconds($etaSecs)
@@ -542,11 +560,12 @@ finally {
         Invoke-SqliteQuery -DataSource $Database `
             -Query "PRAGMA wal_checkpoint(TRUNCATE);" | Out-Null
     } catch { }
+    $committed = Get-CommittedScanCounts -Path $Database -ScanId $scanId
     Complete-ScanRecord -Path $Database -ScanId $scanId -Status $status `
-                        -Folders $totalFolders -Aces $totalAces -Errors $totalErrors
-    Write-Host "Scan $scanId finished: status=$status, folders=$totalFolders, aces=$totalAces, errors=$totalErrors" -ForegroundColor Green
+                        -Folders $committed.folders -Aces $committed.aces -Errors $committed.errors
+    Write-Host "Scan $scanId finished: status=$status, folders=$($committed.folders), aces=$($committed.aces), errors=$($committed.errors)"
 }
 
 
-# Explicit exit code so callers can detect success/failure without parsing output
-if ($status -eq 'completed') { exit 0 } else { exit 1 }
+if ($status -ne 'completed') { throw "Scan $scanId failed. See scan errors for details." }
+exit 0

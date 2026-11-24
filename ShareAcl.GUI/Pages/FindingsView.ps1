@@ -38,7 +38,7 @@ $catalogue = @(
         Name        = 'Orphaned SIDs on ACEs'
         Severity    = 'High'
         SwapCapable = $true
-        Description = 'ACEs referencing SIDs that no longer resolve to an AD principal. These are deleted accounts whose references in the filesystem persist. Core overhaul target.'
+        Description = 'ACEs referencing SIDs that the resolver found on deleted Active Directory objects.'
         Query       = @"
 SELECT f.path AS Path,
        a.trustee_sid AS Sid,
@@ -47,9 +47,30 @@ SELECT f.path AS Path,
        CASE a.is_inherited WHEN 1 THEN 'Y' ELSE 'N' END AS Inherited
 FROM aces a
 JOIN folders f ON f.folder_id = a.folder_id
+JOIN principals p ON p.sid = a.trustee_sid
+WHERE f.scan_id = @scan
+  AND p.principal_type = 'Orphaned' AND p.orphan_confirmed = 1
+ORDER BY f.path
+"@
+    }
+
+    [pscustomobject]@{
+        Id          = 'unclassified'
+        Name        = 'Trustees awaiting resolution'
+        Severity    = 'Info'
+        SwapCapable = $false
+        Description = 'ACEs referencing SIDs without a conclusive identity lookup. Run the resolver to retry these SIDs.'
+        Query       = @"
+SELECT f.path AS Path,
+       a.trustee_sid AS Sid,
+       a.rights_text AS Rights,
+       a.access_control_type AS AceType
+FROM aces a
+JOIN folders f ON f.folder_id = a.folder_id
 LEFT JOIN principals p ON p.sid = a.trustee_sid
 WHERE f.scan_id = @scan
-  AND (p.sid IS NULL OR p.principal_type = 'Orphaned')
+  AND (p.sid IS NULL OR (p.principal_type = 'Unknown' AND p.name IS NULL)
+       OR (p.principal_type = 'Orphaned' AND p.orphan_confirmed = 0))
 ORDER BY f.path
 "@
     }

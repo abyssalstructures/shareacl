@@ -13,7 +13,7 @@ ShareACL is a PowerShell 7 application for Windows that audits NTFS permissions 
 | Capability | What it helps you do |
 | --- | --- |
 | 📁 **Folder view** | Filter and review up to 5,000 matching folders at a time, inspect each folder’s ACEs, identify broken inheritance and explicit permissions, and export the folder and trustee detail to CSV. |
-| 👤 **Account view** | Find folders reachable by a user, group, or computer, show direct versus group-derived access, and optionally verify live effective access. |
+| 👤 **Account view** | Find recorded ACEs for a user, group, or computer, see which groups contributed matches, and optionally check live effective access. |
 | 📋 **Findings** | Prioritise common permission risks such as orphaned SIDs, broad access, direct user ACEs, Deny ACEs, and scan errors. |
 | 🔎 **Collector and resolver** | Scan one or more roots to SQLite, then resolve SIDs and transitive group membership from Active Directory. Run them from the GUI or independently. |
 | 🔃 **ACL Swap** | Preview, execute, audit, and verify a replacement of one explicit trustee with another. Supports scan-based discovery and a live filesystem walk. |
@@ -36,7 +36,7 @@ Run ShareACL from a Windows device that can reach the relevant file shares and, 
 | --- | --- |
 | PowerShell 7+ (Tested on 7.6.3) | GUI, collector, and resolver |
 | [PSSQLite](https://www.powershellgallery.com/packages/PSSQLite) | ShareACL database access |
-| [NTFSSecurity](https://www.powershellgallery.com/packages/NTFSSecurity) | Collecting and changing NTFS ACLs |
+| [NTFSSecurity](https://www.powershellgallery.com/packages/NTFSSecurity) | Collecting NTFS ACLs and checking live effective access |
 | ActiveDirectory module / RSAT | Resolving principals, group memberships, and live AD principal search |
 
 Check the environment before first use:
@@ -116,11 +116,11 @@ Folder CSV exports include the trustee/ACE detail needed for review:
 
 ### Account view
 
-Use **Account view** to answer “what can this principal reach?”
+Use **Account view** to find recorded ACEs that match a principal directly or through a group. Its result count and CSV describe matching ACEs. Live effective access checks the current filesystem.
 
 1. Choose **Pick principal…**.
 2. Search the resolved database identities or Active Directory. The search box receives focus automatically; double-click a result to select it.
-3. Filter by path or restrict the result to Allow and/or explicit ACEs.
+3. Filter by path or restrict the historical matches to Allow and/or explicit ACEs. The Allow filter hides Deny matches.
 4. Review the **Via** column and membership chain to understand direct and group-derived access.
 5. Select a result and use **Live effective access** when a current filesystem check is needed.
 
@@ -130,7 +130,8 @@ The resolver is important here: without resolved group membership, Account view 
 
 Use **Findings** as a first-pass permission review. It groups and prioritises patterns including:
 
-- Orphaned SIDs on ACEs
+- Orphaned SIDs confirmed by a deleted Active Directory object
+- Trustees awaiting a conclusive identity lookup
 - Everyone exposure
 - Non-admin Full Control
 - Explicit Full Control for administrative principals
@@ -153,10 +154,10 @@ ACL Swap replaces explicit ACEs for one principal with equivalent ACEs for anoth
 Live-walk discovery runs in the background and reports folders scanned, matches, and enumeration errors while the application remains responsive.
 
 1. Open **ACL Swap** and choose a source principal, target principal, and scope.
-2. Use **Scan** mode when a suitable scan is loaded; use **Live walk** only when needed.
-3. Choose **Preview** and inspect the affected folders and rights.
+2. Use **Scan** mode to find candidate folders from the selected scan. Use **Live walk** to discover current candidates, including files when **Include files** is enabled. Both modes skip paths that pass through a junction or other reparse point.
+3. Choose **Preview** and review the live explicit rules. If a source rule changes before execution, the path requires a new preview.
 4. Type `APPLY`, then choose **Execute**.
-5. Choose **Verify** to check the live ACL state.
+5. Choose **Verify** to compare the live explicit permissions with the rules recorded for that run.
 
 Swap activity is written to the database and to `ShareAcl.GUI\Logs\swap-audit.jsonl`.
 
@@ -188,13 +189,12 @@ pwsh -NoProfile -File .\Invoke-ShareAclResolver.ps1 `
   -Database "C:\Temp\shareacl.db"
 ```
 
-Resume the most recent running scan:
+Resume a specific interrupted scan using its ID from the scan list:
 
 ```powershell
 pwsh -NoProfile -File .\Invoke-ShareAclCollector.ps1 `
-  -RootPath "\\fileserver01\Finance" `
   -Database "C:\Temp\shareacl.db" `
-  -Resume
+  -Resume -ScanId 42
 ```
 
 Limit depth for a smaller test scan:
@@ -238,7 +238,7 @@ Prefer **Scan** mode. **Live walk** reads the filesystem directly and can be slo
 
 ## Project status
 
-ShareACL v1.0-RC2 is focused on safe permission discovery, investigation, and controlled substitution. See the [CHANGELOG](CHANGELOG) for release detail and [Issues](https://github.com/stellarau/shareacl/issues) for planned work.
+ShareACL v1.0-RC3 is focused on safe permission discovery, investigation, and controlled substitution. See the [CHANGELOG](CHANGELOG) for release detail and [Issues](https://github.com/abyssalstructures/shareacl/issues) for planned work.
 
 The release identifier is maintained in the repository-level [VERSION](VERSION) file. The GUI reads this single source of truth and includes it in the main window title automatically.
 
