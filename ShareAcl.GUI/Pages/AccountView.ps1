@@ -62,7 +62,7 @@ $view.ApplyReachable = {
         }
     }
 
-    $shaped = foreach ($row in $rows) {
+    $shaped = @(foreach ($row in $rows) {
         $via = $viaMap[[string]$row.TrusteeSid]
         $viaSummary = if ($null -eq $via) {
             [string]$row.TrusteeSid
@@ -81,19 +81,19 @@ $view.ApplyReachable = {
             ViaSid     = [string]$row.TrusteeSid
             ViaSummary = $viaSummary
         }
-    }
+    })
 
     $view.MembershipRows = $membershipRows
-    $controls.GrdReachable.ItemsSource = @($shaped)
+    $controls.GrdReachable.ItemsSource = $shaped
     $controls.LstVia.Items.Clear()
     $controls.TxtEffectiveResult.Text = ''
     $controls.BtnLiveEffective.IsEnabled = $false
-    $controls.BtnExportCsv.IsEnabled = (@($shaped).Count -gt 0)
+    $controls.BtnExportCsv.IsEnabled = $shaped.Count -gt 0
 
-    $limitNote = if (@($shaped).Count -ge 20000) { ' (display limit reached)' } else { '' }
+    $limitNote = if ($shaped.Count -ge 20000) { ' (display limit reached)' } else { '' }
     $view.App.SetStatus((
-        'Account view: {0:N0} reachable entries for {1}{2}' -f
-        @($shaped).Count, $view.PrincipalName, $limitNote
+        'Account view: {0:N0} matching ACEs for {1}{2}' -f
+        $shaped.Count, $view.PrincipalName, $limitNote
     ))
 }
 
@@ -136,7 +136,7 @@ $view.LoadReachable = {
         [void]$View.App.StartAsync(
             $View.Context,
             'AccountReachable',
-            'Loading reachable folders…',
+            'Loading matching ACEs…',
             $workerContext,
             {
                 param($Ctx)

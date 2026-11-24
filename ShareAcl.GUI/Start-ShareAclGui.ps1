@@ -68,6 +68,7 @@ $Script:DbNull          = [System.DBNull]::Value
 $Script:ScriptRoot      = $PSScriptRoot
 $Script:PagesRoot       = Join-Path $PSScriptRoot 'Pages'
 $Script:VersionPath     = Join-Path (Split-Path $PSScriptRoot -Parent) 'VERSION'
+. (Join-Path (Split-Path $PSScriptRoot -Parent) 'ShareAcl.Database.ps1')
 
 function Get-NowUtc { [System.DateTime]::UtcNow.ToString('o') }
 
@@ -170,6 +171,7 @@ $Script:App = [pscustomobject]@{
     NavButtons      = @{}
     NavContext      = $null
     IsClosing       = $false
+    SwapExecuting   = $false
     SuppressScanSelectionChanged = $false
 }
 
@@ -542,7 +544,7 @@ function Start-AppAsyncOperation {
         }
         $workerContext.DbPath = $App.DbPath
         $progressQueue = if ($null -ne $OnProgress) {
-            [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+            ,([System.Collections.Concurrent.ConcurrentQueue[object]]::new())
         } else {
             $null
         }
@@ -818,7 +820,8 @@ function Ensure-DatabaseLoaded {
 function Open-ShareAclDatabase {
     param([string]$Path)
 
-    if (-not (Test-Path $Path)) { throw "Database not found: $Path" }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Database not found: $Path" }
+    $Path = (Get-Item -LiteralPath $Path).FullName
 
     # A report may still be reading the current database while the operator
     # opens another one. Stop that work before validation/migration to avoid a
@@ -834,81 +837,10 @@ function Open-ShareAclDatabase {
 "@
     if ($check.n -lt 5) { throw "Not a ShareACL database (missing core tables): $Path" }
 
-    #Migration: ensure swap journal tables exist (additive, idempotent)
-        Invoke-SqliteQuery -DataSource $Path -Query @"
-            CREATE TABLE IF NOT EXISTS swap_runs (
-                run_id TEXT PRIMARY KEY,
-                started_utc TEXT NOT NULL,
-                completed_utc TEXT,
-                operator TEXT NOT NULL,
-                host TEXT NOT NULL,
-                source_sid TEXT NOT NULL,
-                source_name TEXT,
-                target_sid TEXT NOT NULL,
-                target_name TEXT,
-                scope_root TEXT NOT NULL,
-                based_on_scan INTEGER REFERENCES scans(scan_id),
-                discovery_mode TEXT NOT NULL CHECK (discovery_mode IN ('scan','live')),
-                folder_count INTEGER NOT NULL DEFAULT 0,
-                ok_count INTEGER NOT NULL DEFAULT 0,
-                fail_count INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS swap_results (
-                result_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL REFERENCES swap_runs(run_id),
-                path TEXT NOT NULL,
-                result TEXT NOT NULL CHECK (result IN ('ok','fail','skip','noop')),
-                detail TEXT,
-                when_utc TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS ix_swap_results_run ON swap_results(run_id);
-            CREATE INDEX IF NOT EXISTS ix_swap_runs_source ON swap_runs(source_sid);
-            CREATE INDEX IF NOT EXISTS ix_swap_runs_target ON swap_runs(target_sid);
-"@ | Out-Null
-
-    # Migration: progress tracking columns on the scans table
-    $needsProgressMigration = (Invoke-SqliteQuery -DataSource $Path -Query @"
-        SELECT COUNT(*) AS n FROM pragma_table_info('scans') WHERE name = 'total_folders'
-"@).n -eq 0
-
-    if ($needsProgressMigration) {
-        Invoke-SqliteQuery -DataSource $Path -Query @"
-            PRAGMA foreign_keys = OFF;
-            BEGIN;
-            CREATE TABLE scans_new (
-                scan_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                started_utc TEXT NOT NULL,
-                completed_utc TEXT,
-                root_paths_json TEXT NOT NULL,
-                host TEXT,
-                operator TEXT,
-                status TEXT NOT NULL CHECK (status IN ('counting','running','completed','failed','aborted')),
-                folder_count INTEGER NOT NULL DEFAULT 0,
-                ace_count INTEGER NOT NULL DEFAULT 0,
-                error_count INTEGER NOT NULL DEFAULT 0,
-                notes TEXT,
-                total_folders INTEGER,
-                processed_folders INTEGER NOT NULL DEFAULT 0,
-                folders_per_second REAL,
-                estimated_completion_utc TEXT,
-                last_updated_utc TEXT
-            );
-            INSERT INTO scans_new (scan_id, started_utc, completed_utc, root_paths_json,
-                                host, operator, status, folder_count, ace_count, error_count, notes)
-                SELECT scan_id, started_utc, completed_utc, root_paths_json,
-                    host, operator, status, folder_count, ace_count, error_count, notes
-                FROM scans;
-            DROP TABLE scans;
-            ALTER TABLE scans_new RENAME TO scans;
-            COMMIT;
-            PRAGMA foreign_keys = ON;
-"@ | Out-Null
-    }
-
-    Close-ShareAclDatabase
-
+    Initialize-ShareAclDatabaseFile -Database $Path
     $conn = New-SQLiteConnection -DataSource $Path
     if ($conn.State -ne [System.Data.ConnectionState]::Open) { $conn.Open() }
+    Close-ShareAclDatabase
 
     $Script:App.DbPath     = $Path
     $Script:App.Connection = $conn
@@ -931,6 +863,7 @@ function Close-ShareAclDatabase {
         try { $Script:App.Connection.Dispose() } catch { }
     }
     $Script:App.Connection    = $null
+    $Script:App.DbPath        = $null
     $Script:App.CurrentScanId = $null
 }
 
@@ -1207,79 +1140,40 @@ function New-ShareAclDatabase {
         $dlg.Dispose()
     }
 
-    if (Test-Path $target) {
+    $overwrite = [IO.File]::Exists($target)
+    if ($overwrite) {
         $ans = [System.Windows.MessageBox]::Show(
             "$target already exists.`n`nOverwrite? This will delete any existing scans, resolver output, and swap history in that file.",
             'Overwrite existing database?', 'YesNo', 'Warning')
         if ($ans -ne 'Yes') { return }
 
-        # Close any current connection to that file before overwriting
-        if ($Script:App.DbPath -eq $target) { Close-ShareAclDatabase }
-        try {
-            Remove-Item -LiteralPath $target -Force -ErrorAction Stop
-        } catch {
-            [System.Windows.MessageBox]::Show($Script:App.Window,
-                "Could not remove existing file:`n$($_.Exception.Message)",
-                'New database', 'OK', 'Error') | Out-Null
-            return
-        }
     }
 
-    # Delegate schema creation to the collector's Initialize-Database.
-    # Rather than duplicating the schema-loading logic in the shell, we invoke
-    # a minimal pwsh child that dot-sources schema.sql via PSSQLite. This keeps
-    # the schema authoritative in one place (schema.sql).
-    $schemaPath = [System.IO.Path]::GetFullPath((Join-Path $Script:ScriptRoot '..\schema.sql'))
-    if (-not (Test-Path $schemaPath)) {
-        [System.Windows.MessageBox]::Show($Script:App.Window,
-            "schema.sql not found:`n$schemaPath",
-            'New database', 'OK', 'Error') | Out-Null
-        return
-    }
-
+    $stage = Join-Path ([IO.Path]::GetDirectoryName($target)) ".shareacl-$([guid]::NewGuid().ToString('N')).tmp"
+    $closed = $false
     try {
-        # Create the (empty) file so PSSQLite has something to open
-        New-Item -ItemType File -Path $target -Force | Out-Null
-
-        $schemaSql = Get-Content -Raw -Path $schemaPath
-        Invoke-SqliteQuery -DataSource $target -Query $schemaSql | Out-Null
-
-        # Also apply the swap-journal migration (mirrors what Open-ShareAclDatabase does)
-        Invoke-SqliteQuery -DataSource $target -Query @"
-            CREATE TABLE IF NOT EXISTS swap_runs (
-                run_id TEXT PRIMARY KEY,
-                started_utc TEXT NOT NULL,
-                completed_utc TEXT,
-                operator TEXT NOT NULL,
-                host TEXT NOT NULL,
-                source_sid TEXT NOT NULL,
-                source_name TEXT,
-                target_sid TEXT NOT NULL,
-                target_name TEXT,
-                scope_root TEXT NOT NULL,
-                based_on_scan INTEGER REFERENCES scans(scan_id),
-                discovery_mode TEXT NOT NULL CHECK (discovery_mode IN ('scan','live')),
-                folder_count INTEGER NOT NULL DEFAULT 0,
-                ok_count INTEGER NOT NULL DEFAULT 0,
-                fail_count INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS swap_results (
-                result_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL REFERENCES swap_runs(run_id),
-                path TEXT NOT NULL,
-                result TEXT NOT NULL CHECK (result IN ('ok','fail','skip','noop')),
-                detail TEXT,
-                when_utc TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS ix_swap_results_run ON swap_results(run_id);
-            CREATE INDEX IF NOT EXISTS ix_swap_runs_source ON swap_runs(source_sid);
-            CREATE INDEX IF NOT EXISTS ix_swap_runs_target ON swap_runs(target_sid);
-"@ | Out-Null
+        Initialize-ShareAclDatabaseFile -Database $stage
+        $integrity = Invoke-SqliteQuery -DataSource $stage -Query 'PRAGMA quick_check' -As SingleValue
+        if ($integrity -ne 'ok') { throw "Replacement database check failed: $integrity" }
+        if ($Script:App.DbPath -eq $target) {
+            Close-ShareAclDatabase
+            $closed = $true
+        }
+        Publish-ShareAclDatabaseFile -StagedPath $stage -Destination $target -Overwrite $overwrite
     } catch {
+        $message = $_.Exception.Message
+        if ($closed) {
+            try { Open-ShareAclDatabase -Path $target; Refresh-ScanCombo }
+            catch { $message += "`nCould not reopen the original database: $($_.Exception.Message)" }
+        }
         [System.Windows.MessageBox]::Show($Script:App.Window,
-            "Database creation failed:`n$($_.Exception.Message)",
+            "Database creation failed:`n$message",
             'New database', 'OK', 'Error') | Out-Null
         return
+    } finally {
+        foreach ($suffix in '', '-wal', '-shm', '-journal') {
+            Remove-Item -LiteralPath "$stage$suffix" -Force -ErrorAction SilentlyContinue
+        }
     }
 
     # Automatically open the new database and offer to run a scan
@@ -1731,6 +1625,7 @@ function Show-NewScanDialog {
     $dlgState = @{
         Proc          = $null
         Phase         = 'idle'      # idle | collecting | resolving | done | cancelled
+        ScanId        = $null
         RunResolver   = $false
         OnExit        = $null       # scriptblock invoked on UI thread when process exits
         StdoutReg     = $null       # event jobs for cleanup
@@ -1776,6 +1671,7 @@ function Show-NewScanDialog {
     $applyResolverProgress = {
         param($Progress)
 
+        if ($dlgState.Phase -eq 'cancelled') { return }
         $now = [DateTime]::UtcNow
         if ($dlgState.Phase -ne 'resolving') {
             $dlgState.Phase = 'resolving'
@@ -1799,6 +1695,7 @@ function Show-NewScanDialog {
     $drainQueue = {
         $line = $null
         while ($outputQueue.TryDequeue([ref]$line)) {
+            if ($line -match 'Started scan_id=(\d+)') { $dlgState.ScanId = [int]$Matches[1] }
             $progress = ConvertFrom-ResolverProgressLine -Line $line
             if ($null -ne $progress) {
                 & $applyResolverProgress $progress
@@ -1810,16 +1707,15 @@ function Show-NewScanDialog {
     }.GetNewClosure()
 
     $pollProgress = {
-        if ($dlgState.Phase -eq 'resolving') { return }
+        if ($dlgState.Phase -ne 'collecting' -or $null -eq $dlgState.ScanId) { return }
 
         try {
             $row = Invoke-SqliteQuery -DataSource $app.DbPath -Query @"
                 SELECT scan_id, status, total_folders, processed_folders,
                     folders_per_second, estimated_completion_utc, started_utc
                 FROM scans
-                WHERE status IN ('counting','running')
-                ORDER BY scan_id DESC LIMIT 1
-"@
+                WHERE scan_id = @id AND status IN ('counting','running')
+"@ -SqlParameters @{ id = $dlgState.ScanId }
         } catch {
             return
         }
@@ -1953,7 +1849,19 @@ function Show-NewScanDialog {
         if ($cancelled) {
             $dlgState.Phase = 'done'
             $txtStatus.Foreground = [System.Windows.Media.Brushes]::DimGray
-            & $setStatus 'Cancelled. Partial scan can be resumed via -Resume in a manual run.'
+            $scanStatus = if ($dlgState.ScanId) {
+                try {
+                    Invoke-SqliteQuery -DataSource $app.DbPath -Query 'SELECT status FROM scans WHERE scan_id = @id' `
+                        -SqlParameters @{ id = $dlgState.ScanId } -As SingleValue
+                } catch { }
+            }
+            if ($scanStatus -eq 'completed') {
+                & $setStatus "Resolution cancelled. Scan #$($dlgState.ScanId) is complete."
+            } elseif ($dlgState.ScanId) {
+                & $setStatus "Cancelled. Resume scan #$($dlgState.ScanId) with -Resume -ScanId $($dlgState.ScanId)."
+            } else {
+                & $setStatus 'Cancelled before a scan ID was reported. Check the scan list for unfinished scans.'
+            }
             & $refreshScans
             & $setRunningUi $false
             return
@@ -2058,6 +1966,7 @@ function Show-NewScanDialog {
 
         $runResolver = [bool]$chkResolver.IsChecked
         $dlgState.Phase = 'collecting'
+        $dlgState.ScanId = $null
         $dlgState.ResolverStartedUtc = $null
         $dlgState.ResolverLastProgressUtc = $null
         $dlgState.ResolverActivity = $null
@@ -2380,6 +2289,10 @@ $Script:App.PageHost    = $window.FindName('PageHost')
 $Script:App.BusyOverlay = $window.FindName('BusyOverlay')
 $Script:App.BusyText    = $window.FindName('BusyText')
 $window.DataContext     = $Script:App
+$window.Add_Closing({
+    param($sender, $eventArgs)
+    if ($sender.DataContext.SwapExecuting) { $eventArgs.Cancel = $true }
+})
 
 $Script:App.ErrorIndicator.Add_Click({
     param($sender, $eventArgs)

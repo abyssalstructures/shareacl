@@ -40,8 +40,8 @@
                 <Button    Grid.Row="2" Grid.Column="2" x:Name="BtnBrowseScope" Content="Browse…" Padding="10,2" Margin="0,2"/>
 
                 <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Margin="0,6,0,0">
-                    <CheckBox x:Name="ChkIncludeFiles"  Content="Include files (not just folders)" Margin="0,0,16,0"/>
-                    <CheckBox x:Name="ChkSkipReparse"   Content="Skip reparse points / junctions" IsChecked="True" Margin="0,0,16,0"/>
+                    <CheckBox x:Name="ChkIncludeFiles" Content="Include files (live walk only)" Margin="0,0,16,0"
+                              ToolTipService.ShowOnDisabled="True" ToolTip="Folder scans do not contain file ACLs."/>
                     <CheckBox x:Name="ChkOverrideGuard" Content="Allow well-known SID as source (DANGEROUS)" Foreground="#C00"/>
                 </StackPanel>
             </Grid>
@@ -52,7 +52,7 @@
             <StackPanel>
                 <!-- Row 1: discovery mode + preview -->
                 <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                    <TextBlock Text="Discover affected folders:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <TextBlock Text="Discover affected paths:" VerticalAlignment="Center" Margin="0,0,8,0"/>
                     <RadioButton x:Name="RbModeScan" Content="From loaded scan"
                                 VerticalAlignment="Center" GroupName="DiscoveryMode" Margin="0,0,10,0"/>
                     <RadioButton x:Name="RbModeLive" Content="Live walk (queries the filesystem)"
@@ -81,7 +81,7 @@
                     <DataGrid x:Name="GrdPreview" AutoGenerateColumns="False" IsReadOnly="True"
                               CanUserAddRows="False" GridLinesVisibility="Horizontal" RowHeaderWidth="0">
                         <DataGrid.Columns>
-                            <DataGridTextColumn Header="Folder"        Binding="{Binding Path}"         Width="2*"/>
+                            <DataGridTextColumn Header="Path"          Binding="{Binding Path}"         Width="2*"/>
                             <DataGridTextColumn Header="Inh"           Binding="{Binding Inh}"          Width="40"/>
                             <DataGridTextColumn Header="ACE count"     Binding="{Binding AceCount}"     Width="80"/>
                             <DataGridTextColumn Header="Source ACEs"   Binding="{Binding SourceRights}" Width="3*"/>

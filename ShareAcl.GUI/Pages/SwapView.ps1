@@ -4,817 +4,381 @@ param(
     [Parameter(Mandatory)] $App
 )
 
-# Controls
-$txtSource         = $Page.FindName('TxtSource')
-$txtTarget         = $Page.FindName('TxtTarget')
-$txtScope          = $Page.FindName('TxtScope')
-$btnPickSource     = $Page.FindName('BtnPickSource')
-$btnPickTarget     = $Page.FindName('BtnPickTarget')
-$btnBrowseScope    = $Page.FindName('BtnBrowseScope')
-$chkIncludeFiles   = $Page.FindName('ChkIncludeFiles')
-$chkSkipReparse    = $Page.FindName('ChkSkipReparse')
-$chkOverrideGuard  = $Page.FindName('ChkOverrideGuard')
-$rbModeScan        = $Page.FindName('RbModeScan')
-$rbModeLive        = $Page.FindName('RbModeLive')
-
-$btnPreview        = $Page.FindName('BtnPreview')
-$btnExecute        = $Page.FindName('BtnExecute')
-$btnVerify         = $Page.FindName('BtnVerify')
-$txtPreviewStatus  = $Page.FindName('TxtPreviewStatus')
-$txtConfirm        = $Page.FindName('TxtConfirm')
-
-$grdPreview        = $Page.FindName('GrdPreview')
-$txtPreviewSummary = $Page.FindName('TxtPreviewSummary')
-$grdExecute        = $Page.FindName('GrdExecute')
-$pbExecute         = $Page.FindName('PbExecute')
-$grdVerify         = $Page.FindName('GrdVerify')
-$txtVerifySummary  = $Page.FindName('TxtVerifySummary')
-# $txtStatus         = $Page.FindName('TxtStatus') -- replaced by App.SetStatus()
-
-# Page state
+$controls = $App.GetControls($Page, @(
+    'TxtSource', 'TxtTarget', 'TxtScope', 'BtnPickSource', 'BtnPickTarget', 'BtnBrowseScope',
+    'ChkIncludeFiles', 'ChkOverrideGuard', 'RbModeScan', 'RbModeLive', 'BtnPreview',
+    'BtnExecute', 'BtnVerify', 'TxtPreviewStatus', 'TxtConfirm', 'GrdPreview',
+    'TxtPreviewSummary', 'GrdExecute', 'PbExecute', 'GrdVerify', 'TxtVerifySummary'
+))
+$helperPath = Join-Path $PSScriptRoot 'SwapAcl.ps1'
 $state = [pscustomobject]@{
-    Source         = $null        # @{ Sid; Name; Type }
-    Target         = $null        # @{ Sid; Name; Type }
-    Scope          = $null
-    PreviewRows    = @()
-    PreviewHash    = $null        # invalidated whenever any input changes
-    LastExecuteRoot = $null
-    DiscoveryMode  = $null        # 'scan' or 'live'
-    AuditPath      = (Join-Path $PSScriptRoot '..\Logs\swap-audit.jsonl' |
-                       ForEach-Object { [System.IO.Path]::GetFullPath($_) })
+    Source = $null
+    Target = $null
+    Generation = 0
+    Preview = $null
+    LastRun = $null
+    RefreshForScan = $null
 }
-
-# Ensure audit dir exists
-$auditDir = Split-Path $state.AuditPath -Parent
-if (-not (Test-Path $auditDir)) { New-Item -ItemType Directory -Path $auditDir -Force | Out-Null }
-
-# Well-known SIDs that we refuse to substitute without the override
-$wellKnownDangerous = @(
-    'S-1-5-18',           # LOCAL SYSTEM
-    'S-1-5-32-544',       # BUILTIN\Administrators
-    'S-1-3-0',            # CREATOR OWNER
-    'S-1-1-0',            # Everyone
-    'S-1-5-11'            # Authenticated Users
-)
-
-# -----------------------------------------------------------------------------
-# Helpers (as closure scriptblocks — page scope dies after script returns)
-# -----------------------------------------------------------------------------
-
-$testInputsReady = {
-    if (-not $state.Source) { return $false }
-    if (-not $state.Target) { return $false }
-    if (-not $txtScope.Text.Trim()) { return $false }
-    if ($state.Source.Sid -eq $state.Target.Sid) { return $false }
-    return $true
-}.GetNewClosure()
-
-$invalidatePreview = {
-    $state.PreviewHash = $null
-    $btnExecute.IsEnabled = $false
-    $btnVerify.IsEnabled  = $false
-    $txtPreviewStatus.Text = '(preview required before execute)'
-}.GetNewClosure()
-
-$computeInputHash = {
-    $key = "$($state.Source.Sid)|$($state.Target.Sid)|$($txtScope.Text.Trim())|" +
-           "$($chkIncludeFiles.IsChecked)|$($chkSkipReparse.IsChecked)|$($chkOverrideGuard.IsChecked)"
-    $sha = [System.Security.Cryptography.SHA1]::Create()
-    try {
-        ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($key)) |
-            ForEach-Object { '{0:x2}' -f $_ }) -join ''
-    } finally { $sha.Dispose() }
-}.GetNewClosure()
+$Page.Tag.State = $state
+$auditPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'Logs\swap-audit.jsonl'
+$protectedSids = @('S-1-5-18', 'S-1-5-32-544', 'S-1-3-0', 'S-1-1-0', 'S-1-5-11')
 
 $writeAudit = {
-    param([hashtable]$Record)
-    $Record['ts']       = [System.DateTime]::UtcNow.ToString('o')
-    $Record['operator'] = "$env:USERDOMAIN\$env:USERNAME"
-    $Record['host']     = $env:COMPUTERNAME
-    $line = ($Record | ConvertTo-Json -Compress)
-    Add-Content -Path $state.AuditPath -Value $line -Encoding UTF8
+    param([hashtable]$Event)
+
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($auditPath))
+    $Event.ts = [DateTime]::UtcNow.ToString('o')
+    $Event.operator = "$env:USERDOMAIN\$env:USERNAME"
+    $Event.host = $env:COMPUTERNAME
+    Add-Content -LiteralPath $auditPath -Value ($Event | ConvertTo-Json -Compress) -Encoding UTF8 -ErrorAction Stop
 }.GetNewClosure()
 
-$testPathIsDangerousRoot = {
-    param([string]$Path)
-    $trimmed = $Path.TrimEnd('\','/').ToLowerInvariant()
-    if ($trimmed -match '^[a-z]:$')                              { return $true }   # drive root: "C:"
-    if ($trimmed -match '^\\\\[^\\]+\\[^\\]+$')                  { return $true }   # share root: "\\fs01\share"
-    if ($trimmed -in @('c:\windows','c:\program files','c:\program files (x86)','c:\users','c:\programdata')) { return $true }
-    return $false
+$invalidate = {
+    $state.Generation++
+    $state.Preview = $null
+    $App.CancelAsync($Page.Tag, 'SwapPreview')
+    $controls.GrdPreview.ItemsSource = $null
+    $controls.TxtConfirm.Clear()
+    $controls.BtnExecute.IsEnabled = $false
+    $controls.TxtPreviewStatus.Text = 'Preview required before execute.'
+    $controls.TxtPreviewSummary.Text = ''
 }.GetNewClosure()
 
-$getAceSid = {
-    param($Ace)
-
-    # 1. Direct SID access — works for most clean ACEs
-    try {
-        if ($Ace.Account -and $Ace.Account.Sid -and $Ace.Account.Sid.Value) {
-            return [string]$Ace.Account.Sid.Value
-        }
-    } catch { }
-
-    # 2. AccountName / ToString may already be a raw SID string for orphaned trustees
-    $name = $null
-    try { $name = [string]$Ace.Account.AccountName } catch { }
-    if (-not $name) { try { $name = [string]$Ace.Account } catch { } }
-
-    if ($name -match '^S-1-\d+(-\d+)+$') { return $name }
-
-    # 3. Translate the NT account name back to a SID
-    if ($name) {
-        try {
-            $nt  = [System.Security.Principal.NTAccount]::new($name)
-            $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier])
-            return [string]$sid.Value
-        } catch { }
-    }
-
-    return $null
+$setMode = {
+    $controls.RbModeScan.IsEnabled = $null -ne $App.CurrentScanId
+    if (-not $controls.RbModeScan.IsEnabled) { $controls.RbModeLive.IsChecked = $true }
+    $controls.ChkIncludeFiles.IsEnabled = [bool]$controls.RbModeLive.IsChecked
+    if (-not $controls.ChkIncludeFiles.IsEnabled) { $controls.ChkIncludeFiles.IsChecked = $false }
 }.GetNewClosure()
 
-# -----------------------------------------------------------------------------
-# Preview
-# -----------------------------------------------------------------------------
+$state.RefreshForScan = {
+    & $invalidate
+    & $setMode
+    $state.LastRun = $null
+    $controls.BtnVerify.IsEnabled = $false
+    $controls.GrdExecute.ItemsSource = $null
+    $controls.GrdVerify.ItemsSource = $null
+    $controls.TxtVerifySummary.Text = ''
+}.GetNewClosure()
 
-# --- Scan-based discovery (the existing logic, refactored into its own closure) ---
-$runPreviewFromScan = {
-    if (-not $App.CurrentScanId) {
-        $App.ShowError('No scan loaded',
-            'Select a scan from the dropdown, or switch discovery mode to "Live walk".')
+$contextMatches = {
+    param($Inputs)
+
+    $Inputs.Generation -eq $state.Generation -and
+        $Inputs.DbPath -eq $App.DbPath -and $Inputs.ScanId -eq $App.CurrentScanId
+}.GetNewClosure()
+
+$applyPreview = {
+    param($Result, $Owner)
+
+    if (-not (& $contextMatches $Result.Inputs)) { return }
+
+    $count = $Result.Rows.Count
+    $controls.GrdPreview.ItemsSource = $Result.Rows
+    $controls.TxtPreviewSummary.Text = "Checked $($Result.Visited) path(s). $count will change, $($Result.Skipped) reparse path(s) skipped, $($Result.Errors) read or enumeration error(s)."
+    $App.SetStatus("ACL Swap preview: $count affected path(s), $($Result.Errors) error(s).")
+    if ($count -eq 0) {
+        $controls.TxtPreviewStatus.Text = 'No explicit source rules found.'
         return
     }
-
-    $sourceSid = $state.Source.Sid
-    $targetSid = $state.Target.Sid
-
-    try {
-        $rows = $App.Query(@"
-        SELECT f.folder_id AS FolderId,
-            f.path      AS Path,
-            CASE f.inheritance_enabled WHEN 1 THEN 'Y' ELSE 'N' END AS Inh,
-            COUNT(*)    AS AceCount,
-            GROUP_CONCAT(a.access_control_type || ' ' || a.rights_text, '; ') AS SourceRights
-        FROM aces a
-        JOIN folders f ON f.folder_id = a.folder_id
-        WHERE f.scan_id = @scan
-        AND a.trustee_sid = @sid
-        AND f.path LIKE @scope
-        GROUP BY f.folder_id, f.path, f.inheritance_enabled
-        ORDER BY f.path
-"@, @{
-            scan  = $App.CurrentScanId
-            sid   = $sourceSid
-            scope = ($txtScope.Text.TrimEnd('\') + '%')
-        })
-    } catch {
-        $App.ShowError('Preview query failed', $_.Exception.Message)
-        return
-    }
-
-    if (-not $rows -or @($rows).Count -eq 0) {
-        $txtPreviewSummary.Text = "Scan #$($App.CurrentScanId): no ACEs reference $($state.Source.Name) under $($txtScope.Text)."
-        $grdPreview.ItemsSource = @()
-        & $invalidatePreview
-        $App.SetStatus("Preview (scan): 0 affected folders")
-        return
-    }
-
-    $shaped = foreach ($r in $rows) {
-        [pscustomobject]@{
-            FolderId = [int]$r.FolderId
-            Path     = $r.Path
-            Inh      = $r.Inh
-            AceCount = [int]$r.AceCount
-            SourceRights = $r.SourceRights
-        }
-    }
-
-    $state.PreviewRows   = @($shaped)
-    $state.PreviewHash   = & $computeInputHash
-    $state.DiscoveryMode = 'scan'
-
-    $grdPreview.ItemsSource = @($shaped)
-    $totalAces = ($shaped | Measure-Object AceCount -Sum).Sum
-    $txtPreviewSummary.Text =
-        "Source: scan #$($App.CurrentScanId). Would replace $($state.Source.Name) with $($state.Target.Name) " +
-        "on $($shaped.Count) folder(s), affecting $totalAces ACE(s). " +
-        "Execute re-checks the live filesystem and will report drift if any."
-    $txtPreviewStatus.Text = "Preview ready (scan) · type APPLY to enable Execute"
-    $btnExecute.IsEnabled = $false
-    $App.SetStatus("Preview (scan): $($shaped.Count) folders, $totalAces ACEs")
 
     & $writeAudit @{
-        event = 'preview'; mode = 'scan'
-        sourceSid = $sourceSid; sourceName = $state.Source.Name
-        targetSid = $targetSid; targetName = $state.Target.Name
-        scope = $txtScope.Text; folderCount = $shaped.Count
-        aceCount = $totalAces; inputHash = $state.PreviewHash
+        event = 'preview'; mode = $Result.Inputs.Mode; scope = $Result.Inputs.Scope
+        sourceSid = $Result.Inputs.SourceSid; targetSid = $Result.Inputs.TargetSid
+        folderCount = $count; errors = $Result.Errors
     }
+    $state.Preview = $Result
+    $controls.TxtPreviewStatus.Text = 'Preview ready. Type APPLY to enable Execute.'
 }.GetNewClosure()
 
-# Live-walk callbacks are created in the page script's scope so their references
-# to page state and WPF controls remain stable after the worker runspace exits.
-$applyLivePreviewResult = {
-    param($result, $pageContext)
+$reportProgress = {
+    param($Progress, $Owner)
 
-    if (-not $result.Success) {
-        $state.PreviewRows = @()
-        $grdPreview.ItemsSource = @()
-        & $invalidatePreview
-        $txtPreviewSummary.Text = "Live walk failed: $($result.Error)"
-        $App.SetStatus('Live walk failed.')
-        $App.ShowError([string]$result.Title, [string]$result.Error)
-        return
-    }
-
-    $scopeSnapshot = [string]$result.Scope
-    $sourceNameSnapshot = [string]$result.SourceName
-    $found = @($result.Rows | Where-Object { $null -ne $_ })
-    $folderCount = [int]$result.FoldersWalked
-    $errorCount = [int]$result.ErrorCount
-
-    if ($found.Count -eq 0) {
-        $state.PreviewRows = @()
-        $txtPreviewSummary.Text = "Live walk of $scopeSnapshot (scanned $folderCount folder(s)): no explicit ACEs reference $sourceNameSnapshot. $errorCount enumeration error(s)."
-        $grdPreview.ItemsSource = @()
-        & $invalidatePreview
-        $App.SetStatus('Live walk: 0 affected folders')
-        return
-    }
-
-    $state.PreviewRows   = $found
-    $state.PreviewHash   = & $computeInputHash
-    $state.DiscoveryMode = 'live'
-
-    $grdPreview.ItemsSource = $found
-    $totalAces = ($found | Measure-Object AceCount -Sum).Sum
-    $txtPreviewSummary.Text =
-        "Live walk of $scopeSnapshot (scanned $folderCount folder(s)): found $($found.Count) folder(s) with explicit ACEs " +
-        "for $sourceNameSnapshot. Would affect $totalAces ACE(s). $errorCount enumeration error(s)."
-    $txtPreviewStatus.Text = 'Preview ready (live) · type APPLY to enable Execute'
-    $btnExecute.IsEnabled = $false
-    $App.SetStatus("Preview (live): $($found.Count) folders, $totalAces ACEs, $errorCount error(s)")
-
-    & $writeAudit @{
-        event = 'preview'; mode = 'live'
-        sourceSid = [string]$result.SourceSid; sourceName = $sourceNameSnapshot
-        targetSid = [string]$result.TargetSid; targetName = [string]$result.TargetName
-        scope = $scopeSnapshot; foldersWalked = $folderCount
-        folderCount = $found.Count; aceCount = $totalAces
-        errors = $errorCount; inputHash = $state.PreviewHash
-    }
+    $message = "Checked $($Progress.Visited) path(s), $($Progress.Matches) match(es), $($Progress.Errors) error(s)."
+    $controls.TxtPreviewSummary.Text = "$message`nCurrent: $($Progress.Path)"
+    $App.BusyText.Text = $message
+    $App.SetStatus($message)
 }.GetNewClosure()
 
-$reportLivePreviewProgress = {
-    param($progress, $pageContext)
+$runPreview = {
+    & $invalidate
+    try {
+        . $helperPath
+        if (-not $state.Source -or -not $state.Target -or $state.Source.Sid -eq $state.Target.Sid) {
+            throw 'Choose distinct source and target principals.'
+        }
+        if ($state.Source.Sid -in $protectedSids -and -not $controls.ChkOverrideGuard.IsChecked) {
+            throw 'The source is a protected well-known SID. An override is required.'
+        }
+        if ($state.Target.Sid -in $protectedSids) { throw 'The target is a protected well-known SID.' }
+        $scope = ConvertTo-ShareAclPath $controls.TxtScope.Text
+        $protectedPaths = @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, (Split-Path -Parent $env:USERPROFILE))
+        if ($scope.TrimEnd('\') -eq [IO.Path]::GetPathRoot($scope).TrimEnd('\') -or $scope -in $protectedPaths) {
+            throw 'Choose a scope below the drive, share, or system folder root.'
+        }
 
-    $status = "Live walk: $($progress.Folders) folder(s) scanned, $($progress.Hits) hit(s), $($progress.Errors) error(s)"
-    $App.SetStatus($status)
-    if ($null -ne $App.BusyText) { $App.BusyText.Text = $status }
-    $txtPreviewSummary.Text = "$status`nCurrent: $($progress.Path)"
-}.GetNewClosure()
+        $mode = if ($controls.RbModeScan.IsChecked) { 'scan' } else { 'live' }
+        if ($mode -eq 'scan' -and $null -eq $App.CurrentScanId) { throw 'Select a scan first.' }
+        $request = @{
+            Generation = $state.Generation; ScanId = $App.CurrentScanId; Mode = $mode; Scope = $scope
+            SourceSid = [string]$state.Source.Sid; SourceName = [string]$state.Source.Name
+            TargetSid = [string]$state.Target.Sid; TargetName = [string]$state.Target.Name
+            TargetSam = $state.Target.Sam; TargetType = $state.Target.Type
+            IncludeFiles = $mode -eq 'live' -and [bool]$controls.ChkIncludeFiles.IsChecked
+            HelperPath = $helperPath
+        }
+        $controls.TxtPreviewStatus.Text = 'Checking live rules…'
 
-# --- Live filesystem walk ---
-$runPreviewLive = {
-    $scope     = $txtScope.Text.Trim()
-    $sourceSid = $state.Source.Sid
-    $targetSid = $state.Target.Sid
-
-    $txtPreviewSummary.Text = "Walking $scope for explicit ACEs referencing $($state.Source.Name)…"
-    $grdPreview.ItemsSource = @()
-    $state.PreviewRows = @()
-    & $invalidatePreview
-    $txtPreviewStatus.Text = 'Live walk running…'
-    $App.SetStatus('Live walk starting…')
-
-    $skipReparse  = [bool]$chkSkipReparse.IsChecked
-
-    [void]$App.StartAsync(
-        $Page.Tag,
-        'SwapLivePreview',
-        "Walking $scope…",
-        @{
-            Scope      = $scope
-            SourceSid  = [string]$sourceSid
-            SourceName = [string]$state.Source.Name
-            TargetSid  = [string]$targetSid
-            TargetName = [string]$state.Target.Name
-            SkipReparse = $skipReparse
-        },
-        {
+        [void]$App.StartAsync($Page.Tag, 'SwapPreview', "Checking $scope…", $request, {
             param($Ctx)
 
-            try {
-                Import-Module NTFSSecurity -ErrorAction Stop
-            } catch {
-                return [pscustomobject]@{
-                    Success = $false
-                    Title   = 'NTFSSecurity unavailable'
-                    Error   = $_.Exception.Message
-                }
+            . $Ctx.HelperPath
+            if ((Test-ShareAclReparsePath $Ctx.Scope) -or -not [IO.Directory]::Exists($Ctx.Scope)) {
+                throw "The scope must be an accessible directory without reparse points: $($Ctx.Scope)"
             }
-
-            if (-not (Test-Path -LiteralPath $Ctx.Scope)) {
-                return [pscustomobject]@{
-                    Success = $false
-                    Title   = 'Scope not accessible'
-                    Error   = "Cannot access: $($Ctx.Scope)"
-                }
-            }
-
-            $getSid = {
-                param($Ace)
-
-                try {
-                    if ($Ace.Account -and $Ace.Account.Sid -and $Ace.Account.Sid.Value) {
-                        return [string]$Ace.Account.Sid.Value
-                    }
-                } catch { }
-
-                $name = $null
-                try { $name = [string]$Ace.Account.AccountName } catch { }
-                if (-not $name) { try { $name = [string]$Ace.Account } catch { } }
-                if ($name -match '^S-1-\d+(-\d+)+$') { return $name }
-
-                if ($name) {
-                    try {
-                        $nt = [System.Security.Principal.NTAccount]::new($name)
-                        $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier])
-                        return [string]$sid.Value
-                    } catch { }
-                }
-                return $null
-            }
-
-            $found = [System.Collections.Generic.List[object]]::new()
-            $folderCount = 0
-            $errorCount = 0
             $queue = [System.Collections.Generic.Queue[string]]::new()
-            $queue.Enqueue([string]$Ctx.Scope)
+            $visited = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $errors = 0
+            $skipped = 0
+            if ($Ctx.Mode -eq 'scan') {
+                $candidates = Invoke-SqliteQuery -DataSource $Ctx.DbPath -Query @'
+SELECT DISTINCT f.path
+FROM aces a JOIN folders f ON f.folder_id = a.folder_id
+WHERE f.scan_id = @scan AND a.trustee_sid = @sid AND a.is_inherited = 0
+ORDER BY f.path
+'@ -SqlParameters @{ scan = $Ctx.ScanId; sid = $Ctx.SourceSid }
+                foreach ($candidate in $candidates) {
+                    try {
+                        $path = ConvertTo-ShareAclPath $candidate.path
+                        if (Test-ShareAclPathInScope $path $Ctx.Scope) { $queue.Enqueue($path) }
+                    } catch { $errors++ }
+                }
+            } else {
+                $queue.Enqueue($Ctx.Scope)
+            }
 
+            $rows = [System.Collections.Generic.List[object]]::new()
             while ($queue.Count -gt 0) {
-                $current = $queue.Dequeue()
-                $folderCount++
-
-                $isReparse = $false
-                try {
-                    $attr = (Get-Item -LiteralPath $current -Force -ErrorAction Stop).Attributes
-                    $isReparse = [bool]($attr -band [System.IO.FileAttributes]::ReparsePoint)
-                } catch { }
-
-                if (-not ($Ctx.SkipReparse -and $isReparse)) {
-                    try {
-                        $aces = Get-NTFSAccess -Path $current -ExcludeInherited:$true -ErrorAction Stop
-                        $matching = @($aces | Where-Object { (& $getSid $_) -eq $Ctx.SourceSid })
-                        if ($matching.Count -gt 0) {
-                            $inheritance = 'Y'
-                            try {
-                                $inheritanceInfo = Get-NTFSInheritance -Path $current -ErrorAction Stop
-                                if (-not $inheritanceInfo.AccessInheritanceEnabled) { $inheritance = 'N' }
-                            } catch { }
-
-                            $rightsSummary = ($matching | ForEach-Object {
-                                "$($_.AccessControlType) $($_.AccessRights)"
-                            }) -join '; '
-
-                            $found.Add([pscustomobject]@{
-                                FolderId    = $null
-                                Path        = $current
-                                Inh         = $inheritance
-                                AceCount    = $matching.Count
-                                SourceRights = $rightsSummary
-                            })
-                        }
-                    } catch {
-                        $errorCount++
-                    }
-
-                    try {
-                        Get-ChildItem -LiteralPath $current -Directory -Force -ErrorAction Stop |
-                            ForEach-Object { $queue.Enqueue($_.FullName) }
-                    } catch {
-                        $errorCount++
-                    }
+                $path = $queue.Dequeue()
+                if (-not $visited.Add($path)) { continue }
+                if (($visited.Count % 25) -eq 0 -and $null -ne $Ctx.ProgressQueue) {
+                    $Ctx.ProgressQueue.Enqueue(@{ Visited = $visited.Count; Matches = $rows.Count; Errors = $errors; Path = $path })
                 }
 
-                if (($folderCount % 25) -eq 0) {
-                    $progressQueue = $Ctx['ProgressQueue']
-                    if ($null -ne $progressQueue) {
-                        [void]$progressQueue.Enqueue([pscustomobject]@{
-                            Folders = $folderCount
-                            Hits    = $found.Count
-                            Errors  = $errorCount
-                            Path    = $current
+                try {
+                    if (Test-ShareAclReparsePath $path) { $skipped++; continue }
+                    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                    if (-not $item.PSIsContainer -and -not $Ctx.IncludeFiles) { continue }
+                } catch { $errors++; continue }
+
+                try {
+                    $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
+                    $descriptor = Get-ShareAclDescriptor $acl
+                    $source = @(Get-ShareAclExplicitRules $descriptor.DiscretionaryAcl $Ctx.SourceSid)
+                    if ($source.Count -gt 0) {
+                        $rows.Add([pscustomobject]@{
+                            Path = $path; Inh = if ($acl.AreAccessRulesProtected) { 'N' } else { 'Y' }
+                            AceCount = $source.Count; Signature = Get-ShareAclRuleSignature $source
+                            SourceRights = ($source | ForEach-Object {
+                                '{0} {1} ({2})' -f $_.AceType, ([System.Security.AccessControl.FileSystemRights]$_.AccessMask), $_.AceFlags
+                            }) -join '; '
                         })
                     }
+                } catch { $errors++ }
+
+                if ($Ctx.Mode -eq 'live' -and $item.PSIsContainer) {
+                    try {
+                        foreach ($child in Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop) {
+                            if ($child.PSIsContainer -or $Ctx.IncludeFiles) { $queue.Enqueue($child.FullName) }
+                        }
+                    } catch { $errors++ }
                 }
             }
 
-            [pscustomobject]@{
-                Success       = $true
-                Scope         = [string]$Ctx.Scope
-                SourceSid     = [string]$Ctx.SourceSid
-                SourceName    = [string]$Ctx.SourceName
-                TargetSid     = [string]$Ctx.TargetSid
-                TargetName    = [string]$Ctx.TargetName
-                Rows          = @($found)
-                FoldersWalked = $folderCount
-                ErrorCount    = $errorCount
-            }
-        },
-        $applyLivePreviewResult,
-        'Live walk failed',
-        $reportLivePreviewProgress
-    )
-}.GetNewClosure()
-
-# --- Dispatcher: chooses the right discovery mode ---
-$runPreview = {
-    if (-not (& $testInputsReady)) {
-        $App.ShowError('Inputs incomplete',
-            'Set source, target, and scope, and ensure source ≠ target.')
-        return
-    }
-
-    $sourceSid = $state.Source.Sid
-    $targetSid = $state.Target.Sid
-
-    # Guardrails (unchanged from original $runPreview)
-    if ($wellKnownDangerous -contains $sourceSid -and -not $chkOverrideGuard.IsChecked) {
-        $App.ShowError('Source is a well-known SID',
-            "Refusing to substitute $($state.Source.Name) without explicit override.")
-        return
-    }
-    if ($wellKnownDangerous -contains $targetSid) {
-        $App.ShowError('Target is a well-known SID',
-            "Refusing to substitute INTO $($state.Target.Name) under any circumstances.")
-        return
-    }
-    if (& $testPathIsDangerousRoot $txtScope.Text) {
-        $App.ShowError('Scope is too broad',
-            "Refusing to operate on $($txtScope.Text). Pick a subfolder.")
-        return
-    }
-
-    if ($rbModeLive.IsChecked) {
-        & $runPreviewLive
-    } else {
-        & $runPreviewFromScan
+            [pscustomobject]@{ Inputs = $Ctx; Rows = $rows.ToArray(); Visited = $visited.Count; Errors = $errors; Skipped = $skipped }
+        }, $applyPreview, 'ACL Swap preview failed', $reportProgress)
+    } catch {
+        $App.ShowError('ACL Swap preview failed', $_.Exception.Message)
     }
 }.GetNewClosure()
-
-# -----------------------------------------------------------------------------
-# Execute
-# -----------------------------------------------------------------------------
 
 $runExecute = {
-    if (-not $state.PreviewRows -or $state.PreviewRows.Count -eq 0) { return }
-    if ($state.PreviewHash -ne (& $computeInputHash)) {
-        $App.ShowError('Inputs changed', 'Inputs changed since preview. Re-run preview.')
-        & $invalidatePreview
-        $txtConfirm.Text = ''
-        return
-    }
-    if ($txtConfirm.Text.Trim().ToUpper() -ne 'APPLY') {
-        $App.ShowError('Confirmation required', "Type APPLY in the confirmation box.")
-        $txtConfirm.Text = ''
-        $txtConfirm.Focus()
-        return
-    }
+    $preview = $state.Preview
+    if ($App.SwapExecuting -or $null -eq $preview -or -not (& $contextMatches $preview.Inputs) -or
+        $controls.TxtConfirm.Text.Trim() -ne 'APPLY') { return }
 
-    $runId = [System.Guid]::NewGuid().ToString()
-    $txtConfirm.Text = ''
-    $btnExecute.IsEnabled = $false
-    $Page.Dispatcher.Invoke([Action]{}, 'Background')
-    $startUtc = [System.DateTime]::UtcNow.ToString('o')
-
-    # JSONL envelope (forensic log)
-    & $writeAudit @{
-        event = 'execute_begin'; runId = $runId
-        mode = $state.DiscoveryMode
-        inputHash = $state.PreviewHash; folderCount = $state.PreviewRows.Count
-    }
-
-    # DB journal envelope (queryable log)
+    . $helperPath
+    $inputs = $preview.Inputs
+    $runId = [guid]::NewGuid().ToString()
+    $outcomes = [System.Collections.ObjectModel.ObservableCollection[object]]::new()
+    $controls.GrdExecute.ItemsSource = $outcomes
+    $controls.PbExecute.Maximum = $preview.Rows.Count
+    $controls.PbExecute.Value = 0
+    $state.LastRun = $null
+    $controls.BtnVerify.IsEnabled = $false
+    $App.SwapExecuting = $true
+    $App.Window.IsEnabled = $false
     try {
-        $App.Query(@"
-            INSERT INTO swap_runs(run_id, started_utc, operator, host,
-                                  source_sid, source_name, target_sid, target_name,
-                                  scope_root, based_on_scan, discovery_mode, folder_count)
-            VALUES (@id, @start, @op, @hostname, @ss, @sn, @ts, @tn, @scope, @scan, @mode, @fc)
-"@, @{
-            id    = $runId
-            start = $startUtc
-            op    = "$env:USERDOMAIN\$env:USERNAME"
-            hostname = $env:COMPUTERNAME
-            ss    = $state.Source.Sid
-            sn    = $state.Source.Name
-            ts    = $state.Target.Sid
-            tn    = $state.Target.Name
-            scope = $txtScope.Text.Trim()
-            scan  = if ($state.DiscoveryMode -eq 'scan' -and $App.CurrentScanId) {
-                        $App.CurrentScanId
-                    } else { [System.DBNull]::Value }
-            mode  = $state.DiscoveryMode
-            fc    = $state.PreviewRows.Count
+        & $invalidate
+        $App.Query(@'
+INSERT INTO swap_runs(run_id, started_utc, operator, host, source_sid, source_name,
+                      target_sid, target_name, scope_root, based_on_scan, discovery_mode, folder_count)
+VALUES (@id, @started, @op, @hostname, @source, @sourceName, @target, @targetName, @scope, @scan, @mode, @count)
+'@, @{
+            id = $runId; started = [DateTime]::UtcNow.ToString('o'); op = "$env:USERDOMAIN\$env:USERNAME"
+            hostname = $env:COMPUTERNAME; source = $inputs.SourceSid; sourceName = $inputs.SourceName
+            target = $inputs.TargetSid; targetName = $inputs.TargetName; scope = $inputs.Scope
+            scan = if ($inputs.Mode -eq 'scan') { $inputs.ScanId } else { [DBNull]::Value }
+            mode = $inputs.Mode; count = $preview.Rows.Count
         }) | Out-Null
-    } catch {
-        # Non-fatal: JSONL is authoritative; DB journal is best-effort
-        & $writeAudit @{ event = 'swap_runs_insert_failed'; runId = $runId; message = $_.Exception.Message }
-    }
+        & $writeAudit @{ event = 'execute_begin'; runId = $runId; mode = $inputs.Mode; folderCount = $preview.Rows.Count }
 
-    $logRows = New-Object System.Collections.ArrayList
-    $grdExecute.ItemsSource = $logRows
-    $pbExecute.Minimum = 0
-    $pbExecute.Maximum = $state.PreviewRows.Count
-    $pbExecute.Value   = 0
-
-    $btnExecute.IsEnabled = $false
-    $btnPreview.IsEnabled = $false
-
-    $okCount = 0; $failCount = 0
-
-    foreach ($row in $state.PreviewRows) {
-        $when       = [System.DateTime]::Now.ToString('HH:mm:ss')
-        $whenUtc    = [System.DateTime]::UtcNow.ToString('o')
-        $resultCode = $null
-        $resultText = ''
-
-        $skip = $false
-        if ($chkSkipReparse.IsChecked) {
+        $ok = 0
+        $failed = 0
+        foreach ($row in $preview.Rows) {
             try {
-                $attr = (Get-Item -LiteralPath $row.Path -Force -ErrorAction Stop).Attributes
-                if ($attr -band [System.IO.FileAttributes]::ReparsePoint) { $skip = $true }
-            } catch { }
-        }
-
-        if ($skip) {
-            $resultCode = 'skip'
-            $resultText = 'reparse point'
-        } else {
-            try {
-                $liveAces   = Get-NTFSAccess -Path $row.Path -ExcludeInherited:$true -ErrorAction Stop
-                $sourceAces = @($liveAces | Where-Object { (& $getAceSid $_) -eq $state.Source.Sid })
-
-                if ($sourceAces.Count -eq 0) {
-                    $resultCode = 'noop'
-                    $resultText = 'Source SID no longer present (drift since discovery)'
-                } else {
-                    $added = 0
-                    foreach ($ace in $sourceAces) {
-                        Add-NTFSAccess -Path $row.Path `
-                            -Account          $state.Target.Sid `
-                            -AccessRights     $ace.AccessRights `
-                            -AccessType       $ace.AccessControlType `
-                            -InheritanceFlags $ace.InheritanceFlags `
-                            -PropagationFlags $ace.PropagationFlags `
-                            -ErrorAction Stop
-                        $added++
-                    }
-                    $sourceAces | Remove-NTFSAccess -ErrorAction Stop
-
-                    $okCount++
-                    $resultCode = 'ok'
-                    $resultText = "Swapped $added ACE(s)"
-                }
+                if (-not (Test-ShareAclPathInScope $row.Path $inputs.Scope)) { throw "Path is outside scope: $($row.Path)" }
+                $result = Invoke-ShareAclReplacement $row.Path $inputs.SourceSid $inputs.TargetSid $row.Signature
             } catch {
-                $failCount++
-                $resultCode = 'fail'
-                $resultText = $_.Exception.Message
+                $result = @{ Code = 'fail'; Detail = $_.Exception.Message }
             }
+            if ($result.Code -eq 'ok') { $ok++ }
+            if ($result.Code -eq 'fail') { $failed++ }
+            $outcomes.Add([pscustomobject]@{
+                When = [DateTime]::Now.ToString('HH:mm:ss'); Path = $row.Path
+                Result = $result.Code.ToUpperInvariant(); Detail = $result.Detail; Expected = $result.Expected
+            })
+            & $writeAudit @{
+                event = 'execute_op'; runId = $runId; path = $row.Path
+                result = $result.Code; detail = $result.Detail; expectedTargetRules = $result.Expected
+            }
+            $App.Query(@'
+INSERT INTO swap_results(run_id, path, result, detail, when_utc) VALUES (@id, @path, @result, @detail, @when)
+'@, @{ id = $runId; path = $row.Path; result = $result.Code; detail = $result.Detail; when = [DateTime]::UtcNow.ToString('o') }) | Out-Null
+            $controls.PbExecute.Value++
+            $Page.Dispatcher.Invoke([Action]{}, 'Background')
         }
 
-        # In-memory log row
-        [void]$logRows.Add([pscustomobject]@{
-            When = $when; Path = $row.Path
-            Result = $resultCode.ToUpper(); Detail = $resultText
-        })
-
-        # JSONL audit (forensic)
-        & $writeAudit @{
-            event = 'execute_op'; runId = $runId
-            path = $row.Path; result = $resultCode; detail = $resultText
-        }
-
-        # DB journal (queryable)
-        try {
-            $App.Query(@"
-                INSERT INTO swap_results(run_id, path, result, detail, when_utc)
-                VALUES (@id, @p, @r, @d, @t)
-"@, @{
-                id = $runId; p = $row.Path; r = $resultCode
-                d  = $resultText; t = $whenUtc
+        & $writeAudit @{ event = 'execute_end'; runId = $runId; ok = $ok; failed = $failed }
+        $App.Query(@'
+UPDATE swap_runs SET completed_utc = @done, ok_count = @ok, fail_count = @failed WHERE run_id = @id
+'@, @{ id = $runId; done = [DateTime]::UtcNow.ToString('o'); ok = $ok; failed = $failed }) | Out-Null
+        if ($ok -gt 0) {
+            $App.Query(@'
+INSERT INTO principals(sid, name, domain, sam_account_name, principal_type, is_well_known, last_resolved_utc)
+VALUES (@sid, @name, @domain, @sam, @type, 0, @now) ON CONFLICT(sid) DO NOTHING
+'@, @{
+                sid = $inputs.TargetSid; name = $inputs.TargetName; domain = $env:USERDOMAIN
+                sam = $inputs.TargetSam; type = $inputs.TargetType; now = [DateTime]::UtcNow.ToString('o')
             }) | Out-Null
-        } catch { }
-
-        $pbExecute.Value += 1
-        $Page.Dispatcher.Invoke([Action]{}, 'Background')
-    }
-
-    # Close out the run
-    & $writeAudit @{
-        event = 'execute_end'; runId = $runId
-        ok = $okCount; failed = $failCount
-    }
-    try {
-        $App.Query(@"
-            UPDATE swap_runs SET completed_utc=@done, ok_count=@ok, fail_count=@fail
-            WHERE run_id=@id
-"@, @{
-            done = [System.DateTime]::UtcNow.ToString('o')
-            ok = $okCount; fail = $failCount; id = $runId
-        }) | Out-Null
-    } catch { }
-
-    # Persist target principal so it's pickable for a reverse swap
-    if ($okCount -gt 0) {
-        try {
-            $App.Query(@"
-                INSERT INTO principals(sid, name, domain, sam_account_name,
-                                       principal_type, is_well_known, last_resolved_utc)
-                VALUES (@sid, @name, @domain, @sam, @type, 0, @now)
-                ON CONFLICT(sid) DO UPDATE SET
-                    name              = excluded.name,
-                    sam_account_name  = excluded.sam_account_name,
-                    principal_type    = excluded.principal_type,
-                    last_resolved_utc = excluded.last_resolved_utc
-"@, @{
-                sid    = $state.Target.Sid
-                name   = $state.Target.Name
-                domain = $env:USERDOMAIN
-                sam    = $state.Target.Sam
-                type   = $state.Target.Type
-                now    = [System.DateTime]::UtcNow.ToString('o')
-            }) | Out-Null
-            & $writeAudit @{ event = 'persist_target'; runId = $runId; sid = $state.Target.Sid; name = $state.Target.Name }
-        } catch {
-            & $writeAudit @{ event = 'persist_target_failed'; runId = $runId; message = $_.Exception.Message }
         }
+        $App.SetStatus("ACL Swap complete: $ok replaced, $failed failed, $($outcomes.Count - $ok - $failed) skipped or changed since preview.")
+    } catch {
+        $App.Window.IsEnabled = $true
+        $App.ShowError('ACL Swap stopped', "Run $runId. $($_.Exception.Message) Review the execute log for paths already processed.")
+    } finally {
+        $state.LastRun = [pscustomobject]@{ Id = $runId; Inputs = $inputs; Outcomes = $outcomes }
+        $controls.BtnVerify.IsEnabled = $outcomes.Count -gt 0
+        $App.Window.IsEnabled = $true
+        $App.SwapExecuting = $false
     }
-
-    $state.LastExecuteRoot = $txtScope.Text
-    $btnPreview.IsEnabled = $true
-    $btnVerify.IsEnabled  = $true
-    $App.SetStatus("Execute complete: $okCount OK, $failCount failed")
 }.GetNewClosure()
-
-# -----------------------------------------------------------------------------
-# Verify
-# -----------------------------------------------------------------------------
 
 $runVerify = {
-    if (-not $state.PreviewRows -or $state.PreviewRows.Count -eq 0) { return }
-
-    $txtVerifySummary.Text = "Verifying live ACLs for $($state.PreviewRows.Count) folders…"
-    $rows = New-Object System.Collections.ArrayList
-    $grdVerify.ItemsSource = $rows
-
-    Import-Module NTFSSecurity -ErrorAction SilentlyContinue
-
-    $stillSource = 0; $hasTarget = 0; $clean = 0; $errors = 0
-
-    foreach ($r in $state.PreviewRows) {
-        try {
-            $live = Get-NTFSAccess -Path $r.Path -ExcludeInherited:$false -ErrorAction Stop
-            $sourceSids = @($live | Where-Object { (& $getAceSid $_) -eq $state.Source.Sid })
-            $targetSids = @($live | Where-Object { (& $getAceSid $_) -eq $state.Target.Sid })
-
-            $status =
-                if ($sourceSids.Count -gt 0) { 'SOURCE_REMAINS'; $stillSource++ }
-                elseif ($targetSids.Count -gt 0) { 'OK'; $clean++; $hasTarget++ }
-                else { 'NO_TRACE'; $clean++ }
-
-            $detail =
-                if ($sourceSids.Count -gt 0) {
-                    "Source SID still present on $($sourceSids.Count) ACE(s)"
-                } elseif ($targetSids.Count -gt 0) {
-                    "Target SID present on $($targetSids.Count) ACE(s)"
+    $run = $state.LastRun
+    if ($null -eq $run) { return }
+    . $helperPath
+    $clean = 0
+    $rows = foreach ($row in $run.Outcomes) {
+        $status = 'NOT_APPLIED'
+        $detail = $row.Detail
+        if ($row.Result -eq 'OK') {
+            try {
+                if (Test-ShareAclReparsePath $row.Path) { throw 'A reparse point is now present in the path.' }
+                $descriptor = Get-ShareAclDescriptor (Get-Acl -LiteralPath $row.Path -ErrorAction Stop)
+                $source = @(Get-ShareAclExplicitRules $descriptor.DiscretionaryAcl $run.Inputs.SourceSid)
+                $target = @(Get-ShareAclExplicitRules $descriptor.DiscretionaryAcl $run.Inputs.TargetSid)
+                if ($source.Count -gt 0) {
+                    $status = 'SOURCE_REMAINS'
+                    $detail = "$($source.Count) explicit source rule(s) remain."
+                } elseif ($target.Count -eq 0 -or (Get-ShareAclRuleSignature $target) -cne $row.Expected) {
+                    $status = 'TARGET_MISMATCH'
+                    $detail = 'The explicit target rules differ from the recorded replacement.'
                 } else {
-                    "Neither SID present (folder may have only inherited ACEs)"
+                    $status = 'OK'
+                    $detail = 'Explicit source rules removed and target rules match.'
+                    $clean++
                 }
-
-            [void]$rows.Add([pscustomobject]@{
-                Path = $r.Path; Status = $status; Detail = $detail
-            })
-        } catch {
-            $errors++
-            [void]$rows.Add([pscustomobject]@{
-                Path = $r.Path; Status = 'ERR'; Detail = $_.Exception.Message
-            })
+            } catch {
+                $status = 'ERROR'
+                $detail = $_.Exception.Message
+            }
         }
+        [pscustomobject]@{ Path = $row.Path; Status = $status; Detail = $detail }
     }
-
-    $txtVerifySummary.Text =
-        "Verification: $clean clean, $stillSource still contain source SID, $errors error(s). " +
-        "If 'still contain source' is non-zero, those folders need a follow-up run."
-    $App.SetStatus("Verify: $clean clean, $stillSource remaining, $errors errors")
-
-    & $writeAudit @{
-        event       = 'verify'
-        clean       = $clean
-        stillSource = $stillSource
-        errors      = $errors
-    }
+    $controls.GrdVerify.ItemsSource = @($rows)
+    $controls.TxtVerifySummary.Text = "Run $($run.Id): $clean verified, $($run.Outcomes.Count - $clean) not verified."
+    $App.SetStatus($controls.TxtVerifySummary.Text)
+    try { & $writeAudit @{ event = 'verify'; runId = $run.Id; clean = $clean; notVerified = $run.Outcomes.Count - $clean } }
+    catch { $App.ShowError('Verify audit failed', $_.Exception.Message) }
 }.GetNewClosure()
 
-# -----------------------------------------------------------------------------
-# Event wiring
-# -----------------------------------------------------------------------------
-
-$btnPickSource.Add_Click({
+$controls.BtnPickSource.Add_Click({
     $defaultSource = if ($App.CurrentScanId) { 'Database' } else { 'ActiveDirectory' }
     $pick = $App.PickPrincipal('Pick the source principal (to be replaced)', $defaultSource)
-    if (-not $pick) { return }
-    $state.Source = $pick
-    $txtSource.Text = "$($pick.Name)   [$($pick.Type)]   $($pick.Sid)"
-    & $invalidatePreview
+    if ($pick) {
+        $state.Source = $pick
+        $controls.TxtSource.Text = "$($pick.Name)   [$($pick.Type)]   $($pick.Sid)"
+        & $invalidate
+    }
 }.GetNewClosure())
-
-$btnPickTarget.Add_Click({
+$controls.BtnPickTarget.Add_Click({
     $pick = $App.PickPrincipal('Pick the target principal (replacement)', 'ActiveDirectory')
-    if (-not $pick) { return }
-    $state.Target = $pick
-    $txtTarget.Text = "$($pick.Name)   [$($pick.Type)]   $($pick.Sid)"
-    & $invalidatePreview
+    if ($pick) {
+        $state.Target = $pick
+        $controls.TxtTarget.Text = "$($pick.Name)   [$($pick.Type)]   $($pick.Sid)"
+        & $invalidate
+    }
 }.GetNewClosure())
-
-$btnBrowseScope.Add_Click({
-    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+$controls.BtnBrowseScope.Add_Click({
+    $dialog = [System.Windows.Forms.FolderBrowserDialog]::new()
     try {
-        $dlg.Description = 'Pick the scope root for the substitution'
-        if (-not [string]::IsNullOrWhiteSpace($txtScope.Text)) {
-            $dlg.SelectedPath = $txtScope.Text
-        }
-        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            $txtScope.Text = $dlg.SelectedPath
-            & $invalidatePreview
-        }
-    } finally {
-        $dlg.Dispose()
-    }
+        $dialog.Description = 'Pick the scope root for the substitution'
+        $dialog.SelectedPath = $controls.TxtScope.Text
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $controls.TxtScope.Text = $dialog.SelectedPath }
+    } finally { $dialog.Dispose() }
 }.GetNewClosure())
-
-$txtScope.Add_TextChanged({ & $invalidatePreview }.GetNewClosure())
-$chkIncludeFiles.Add_Click({ & $invalidatePreview }.GetNewClosure())
-$chkSkipReparse.Add_Click({ & $invalidatePreview }.GetNewClosure())
-$chkOverrideGuard.Add_Click({ & $invalidatePreview }.GetNewClosure())
-
-$btnPreview.Add_Click($runPreview)
-
-$txtConfirm.Add_TextChanged({
-    $btnExecute.IsEnabled = (
-        $state.PreviewRows -and
-        $state.PreviewRows.Count -gt 0 -and
-        $txtConfirm.Text.Trim().ToUpper() -eq 'APPLY'
-    )
+$controls.TxtScope.Add_TextChanged($invalidate)
+$controls.ChkIncludeFiles.Add_Click($invalidate)
+$controls.ChkOverrideGuard.Add_Click($invalidate)
+$modeChanged = { & $setMode; & $invalidate }.GetNewClosure()
+$controls.RbModeScan.Add_Click($modeChanged)
+$controls.RbModeLive.Add_Click($modeChanged)
+$controls.TxtConfirm.Add_TextChanged({
+    $controls.BtnExecute.IsEnabled = -not $App.SwapExecuting -and $null -ne $state.Preview -and
+        (& $contextMatches $state.Preview.Inputs) -and $controls.TxtConfirm.Text.Trim() -eq 'APPLY'
 }.GetNewClosure())
-
-$btnExecute.Add_Click($runExecute)
-$btnVerify.Add_Click($runVerify)
-
-# Initial UI state
-# Default discovery mode: scan if one is loaded, live otherwise.
-# Disable the Scan option entirely when no scan is selected so the choice is unambiguous.
-if ($App.CurrentScanId) {
-    $rbModeScan.IsChecked = $true
-} else {
-    $rbModeScan.IsEnabled = $false
-    $rbModeLive.IsChecked = $true
-}
-
-# Re-invalidate preview if the operator switches modes after picking one
-$rbModeScan.Add_Click({ & $invalidatePreview }.GetNewClosure())
-$rbModeLive.Add_Click({ & $invalidatePreview }.GetNewClosure())
-
-# Release grid data when the page is unloaded (Frame.Content swap or window close)
+$controls.BtnPreview.Add_Click($runPreview)
+$controls.BtnExecute.Add_Click($runExecute)
+$controls.BtnVerify.Add_Click($runVerify)
 $Page.Add_Unloaded({
-    try { $App.CancelAsync($Page.Tag, 'SwapLivePreview') } catch { }
-    try { $grdPreview.ItemsSource = $null } catch { }
-    try { $grdExecute.ItemsSource = $null } catch { }
-    try { $grdVerify.ItemsSource  = $null } catch { }
-    $state.PreviewRows = @()
+    $App.CancelAsync($Page.Tag, 'SwapPreview')
+    foreach ($grid in @($controls.GrdPreview, $controls.GrdExecute, $controls.GrdVerify)) { $grid.ItemsSource = $null }
+    $state.Preview = $null
+    $state.LastRun = $null
 }.GetNewClosure())
 
-& $invalidatePreview
-$App.SetStatus("Swap workflow loaded.")
+$controls.RbModeScan.IsChecked = $null -ne $App.CurrentScanId
+$controls.RbModeLive.IsChecked = -not $controls.RbModeScan.IsChecked
+& $setMode
+& $invalidate
 
-# Pre-fill scope if navigated from another view that set NavContext.Scope
 if ($App.NavContext) {
-    $ctx = $App.NavContext
-    $App.NavContext = $null   # consume once
-
-    if ($ctx.Scope) {
-        $txtScope.Text = [string]$ctx.Scope
-    }
-    if ($ctx.SourceSid) {
-        $state.Source = @{
-            Sid  = [string]$ctx.SourceSid
-            Name = [string]$ctx.SourceName
-            Sam  = $null
-            Type = $null
-        }
-        $txtSource.Text = "$($state.Source.Name)   [from Findings]   $($state.Source.Sid)"
-        $App.SetStatus("Source pre-filled from Findings: $($state.Source.Name)")
+    $context = $App.NavContext
+    $App.NavContext = $null
+    if ($context.Scope) { $controls.TxtScope.Text = [string]$context.Scope }
+    if ($context.SourceSid) {
+        $state.Source = @{ Sid = [string]$context.SourceSid; Name = [string]$context.SourceName }
+        $controls.TxtSource.Text = "$($state.Source.Name)   [from Findings]   $($state.Source.Sid)"
     }
 }

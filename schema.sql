@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS scans (
     processed_folders        INTEGER NOT NULL DEFAULT 0,
     folders_per_second       REAL,
     estimated_completion_utc TEXT,
-    last_updated_utc         TEXT
+    last_updated_utc         TEXT,
+    max_depth                INTEGER
 );
 
 -- One row per folder visited
@@ -66,7 +67,8 @@ CREATE TABLE IF NOT EXISTS principals (
     principal_type     TEXT NOT NULL CHECK (principal_type IN
                           ('User','Group','Computer','WellKnown','ForeignSecurityPrincipal','Orphaned','Unknown')),
     is_well_known      INTEGER NOT NULL DEFAULT 0,
-    last_resolved_utc  TEXT NOT NULL
+    last_resolved_utc  TEXT NOT NULL,
+    orphan_confirmed   INTEGER NOT NULL DEFAULT 0
 );
 
 -- Transitive group membership: one row per (group, transitive member, shortest depth)
